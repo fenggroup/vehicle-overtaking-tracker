@@ -15,22 +15,24 @@ An automated algorithm for detecting and analyzing vehicle overtaking events usi
 ``` bash
 vehicle-pass-tracker/
 ├── data/
-│ ├── images/
-│ │ ├── trip1/ # Place Trip 1 IR images here
-│ │ └── trip2/ # Place Trip 2 IR images here
 │ └── ground_truth_annotations/
-│ ├── trip1/ # Place Trip 1 ground truth CSV files here
-│ └── trip2/ # Place Trip 2 ground truth CSV files here
+│   ├── trip1/ # Ground truth CSV files for Trip 1
+│   └── trip2/ # Ground truth CSV files for Trip 2
+│ ├── trip1/ # Place Trip 1 IR images here
+│ └── trip2/ # Place Trip 2 IR images here
 ├── results/
-│ └── overtaking_tracker/
+│ └── analysis/
 │ ├── trip1/ # Results for Trip 1
 │ └── trip2/ # Results for Trip 2
 ├── src/
+│ └── __init.py__
 │ ├── tracker.py # Core implementation
 │ └── utils.py # Utility functions
+│ └── visualization.py # Visualization functions
 ├── main_trip1.py # Trip 1 execution script
 ├── main_trip2.py # Trip 2 execution script
 └── requirements.txt
+└── vehicle_pass_tracker_analysis.ipynb  # Example Jupyter Notebook to analyze the results
 ```
 
 ## Requirements
