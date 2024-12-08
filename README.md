@@ -98,7 +98,7 @@ Results are saved in results/:
 - vehicle_class: Type of vehicle (Car, Motorcycle, Bus, Truck)
 
 ## Analysis Tools
-The repository includes overtaking_detection_analysis.ipynb for analyzing detection results:
+The repository includes vehicle_pass_tracker_analysis.ipynb for analyzing detection results:
 - Features:
     - Compares detection results with ground truth annotations
     - Calculates performance metrics:
