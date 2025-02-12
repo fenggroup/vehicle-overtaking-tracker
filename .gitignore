@@ -1,8 +1,9 @@
 # Raw data and inference result files
-results/analysis/
+results/
+data/
 
 # Pre-trained model files
-yolov8m.pt
+*.pt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

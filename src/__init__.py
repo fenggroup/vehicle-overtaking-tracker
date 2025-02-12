@@ -1,6 +1,6 @@
 """
 VehiclePassTracker - A package for detecting and analyzing vehicle overtaking events
-using bicycle-mounted IR cameras.
+from image sequences.
 """
 
 from .tracker import VehiclePassTracker
