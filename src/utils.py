@@ -4,13 +4,41 @@ Utility functions for vehicle tracking and analysis.
 import cv2
 import numpy as np
 import os
+from natsort import natsorted
+from datetime import datetime
+
+def get_sorted_images(folder_path):
+    """Get all image files in a folder sorted by filename"""
+
+    # Check if folder exists
+    if not os.path.exists(folder_path):
+        raise FileNotFoundError(f"Folder not found: {folder_path}")
+    
+    # Get all image files (assuming jpg/jpeg/png extensions)
+    image_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    
+    # Raise an error if no image files are found
+    if not image_files:
+        raise ValueError(f"No image files found in the folder '{folder_path}'.")
+
+    # Sort files naturally using natsort
+    return natsorted(image_files)    
 
 def get_class_name(class_id):
     """Get class name from class ID"""
     class_names = {2: 'Car', 3: 'Motorcycle', 5: 'Bus', 7: 'Truck'}
     return class_names.get(class_id, 'Unknown')
 
-def calculate_angle(x, y, frame_height, frame_width):
+def get_reference_point(frame_height, frame_width, refn='bottom_center'):
+    """Get reference point coordinates based on image source (eg. camera) position or setup"""
+    if refn == 'bottom_center':
+        return frame_width / 2, frame_height
+    elif refn == 'bottom_left':
+        return 0, frame_height
+    else:
+        raise ValueError(f"Unknown reference point type: {refn}")
+
+def calculate_angle(x, y, frame_height, frame_width, image_source_position):
     """
     Calculate angle between vehicle position and bottom center reference
     Returns angle in degrees where:
@@ -18,8 +46,7 @@ def calculate_angle(x, y, frame_height, frame_width):
     - Positive angles towards the right side (0 to 90)
     """
     # Reference point is bottom center of frame
-    ref_x = frame_width / 2
-    ref_y = frame_height
+    ref_x, ref_y = get_reference_point(frame_height, frame_width, image_source_position)
 
     # Calculate relative position
     dx = x - ref_x
@@ -73,3 +100,13 @@ def images_to_video(image_folder: str,
     video.release()
 
     print(f"Video saved as {output_file}")
+
+def log_timing(output_folder, sequence_name, start_time, end_time):
+    log_path = os.path.join(output_folder, 'timing_log.txt')
+    with open(log_path, 'a') as f:
+        f.write(f'{sequence_name}\n')
+        print(start_time)
+        f.write(f'Start time: {datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S")}\n')
+        f.write(f'End time: {datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S")}\n')
+        f.write(f'Duration: {end_time - start_time:.2f} seconds\n\n')
+        print(end_time)
