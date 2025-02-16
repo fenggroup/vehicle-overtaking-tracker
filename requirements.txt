@@ -1,6 +1,11 @@
-ultralytics>=8.0.0
-opencv-python>=4.8.0
-supervision>=0.3.0
-pandas>=2.0.0
-numpy>=1.24.0
-natsort>=8.4.0
+# Core dependencies
+ultralytics==8.0.0     # YOLOv5 model
+opencv-python==4.8.0   # Image processing
+supervision==0.3.0     # ByteTrack implementation
+pandas==2.0.0         # Data handling
+numpy==1.24.0         # Numerical operations
+natsort==8.4.0       # Natural sorting for image sequences
+
+# Optional for development
+jupyter              # For running analysis notebook
+matplotlib          # For visualization

@@ -1,84 +1,130 @@
 """
-Core implementation of vehicle overtaking detection and tracking using YOLOv5 and ByteTrack.
+Core implementation of vehicle passing detection and tracking.
+
+This module provides the main VehiclePassTracker class that implements:
+- Vehicle detection using YOLOv5
+- Object tracking with ByteTrack
+- Angle-based passing event validation
+- Event logging and visualization
+
+Example:
+    tracker = VehiclePassTracker(
+        image_sequence_path='./data/images/',
+        output_folder='./results/',
+        mode='demo'
+    )
+    tracker.process_sequence()
 """
-from ultralytics import YOLO
+
+import logging
+from pathlib import Path
+from typing import Dict, Set, Optional
+
 import cv2
 import supervision as sv
 import pandas as pd
+from ultralytics import YOLO
 import os
+
 from .visualization import draw_visualizations
 from .utils import calculate_angle, get_sorted_images
+from .types import VehiclePassEvent, TrackerConfig
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 class VehiclePassTracker:
-    """
-    Tracks and analyzes vehicles overtaking a bicycle using YOLOv5 and ByteTrack.
-    Uses angle-based validation for overtaking detection.
-    """
+    """Tracks and analyzes vehicles passing a bicycle using YOLOv5 and ByteTrack."""
     
-    def __init__(self, image_sequence_path, output_folder, mode='demo', 
-                 image_source_position='bottom_center', 
-                 excluded_frames_path=None,
-                 min_frames_threshold=5,
-                 tolerance_threshold=10):
-        # Initialize models and trackers
-        self.model = YOLO('yolov5lu.pt') # Initialize YOLO model
-        self.tracker = sv.ByteTrack()   # Initialize ByteTrack tracker
+    def __init__(
+        self, 
+        image_sequence_path: str, 
+        output_folder: str, 
+        mode: str = 'demo',
+        image_source_position: str = 'bottom_center',
+        excluded_frames_path: Optional[str] = None,
+        config: Optional[TrackerConfig] = None
+    ):
+        """
+        Initialize the vehicle pass tracker with paths and configuration
         
-        # Valid vehicle classes (car, motorcycle, bus, truck)
-        self.valid_classes = [2, 3, 5, 7]
+        Args:
+            image_sequence_path: Path to input image sequence
+            output_folder: Where to save results
+            mode: Operating mode ('demo' or 'debug')
+            image_source_position: Camera position reference
+            excluded_frames_path: Optional CSV with frames to exclude
+            config: Optional custom configuration
+        """
+        self.config = config or TrackerConfig()
+        self._setup_paths(image_sequence_path, output_folder)
+        self._initialize_models()
         
-        # Path configurations
-        self.image_sequence_path = image_sequence_path
-        self.output_folder = output_folder
-        self.output_image_folder = output_folder + '/inference_images/'
-        
-        # Create output folders
-        os.makedirs(output_folder, exist_ok=True)
-        os.makedirs(self.output_image_folder, exist_ok=True)
-        
-        # Initialize tracking storage
-        self._initialize_tracking_storage()
-
-        # Algorithm configurations
+        # Algorithm settings
         self.mode = mode
         self.image_source_position = image_source_position
-
-        # Post-processing configurations
-        self.excluded_frames_path = excluded_frames_path
-        self.min_frames_threshold = min_frames_threshold
-        self.tolerance_threshold = tolerance_threshold
-        self.excluded_ranges = None
+        self._load_exclusions(excluded_frames_path)
         
-        # Load exclusion ranges if provided
-        if excluded_frames_path and os.path.exists(excluded_frames_path):
-            self.excluded_ranges = pd.read_csv(excluded_frames_path)
+        # Initialize tracking state
+        self._initialize_tracking_storage()
 
-        # Add tracking for temporary potential overtaking events
-        self.potential_overtaking = {}  # track_id: consecutive valid frames count
+    def _initialize_models(self) -> None:
+        """Initialize detection and tracking models."""
+        try:
+            # Initialize YOLOv5 model
+            self.model = YOLO('yolov5lu.pt')  # Using YOLOv5 base model
+            self.tracker = sv.ByteTrack()
+        except Exception as e:
+            logger.error(f"Failed to initialize models: {e}")
+            raise
+
+    def _setup_paths(self, image_sequence_path: str, output_folder: str) -> None:
+        """Setup input/output paths and create necessary directories."""
+        self.image_sequence_path = Path(image_sequence_path)
+        self.output_folder = Path(output_folder)
+        self.output_image_folder = self.output_folder / 'inference_images'
+        
+        # Create output directories
+        self.output_folder.mkdir(parents=True, exist_ok=True)
+        self.output_image_folder.mkdir(parents=True, exist_ok=True)
+
+    def _load_exclusions(self, excluded_frames_path: Optional[str]) -> None:
+        """Load excluded frame ranges from CSV file."""
+        self.excluded_ranges = None
+        if excluded_frames_path:
+            try:
+                excluded_df = pd.read_csv(excluded_frames_path)
+                if not all(col in excluded_df.columns for col in ['start_frame', 'end_frame']):
+                    logger.warning("Excluded frames CSV must have 'start_frame' and 'end_frame' columns")
+                else:
+                    self.excluded_ranges = excluded_df
+                    logger.info(f"Loaded {len(excluded_df)} excluded frame ranges")
+            except Exception as e:
+                logger.error(f"Failed to load excluded frames: {e}")
+                self.excluded_ranges = None
 
     def _initialize_tracking_storage(self):
         """Initialize data structures for tracking"""
-        self.overtaking_data = {
-            'overtaking_id': [],
+        self.passing_data = {
+            'pass_id': [],
             'track_id': [],
             'first_frame': [],
             'last_frame': [],
             'vehicle_class': []
         }
 
-        # Track active vehicles and maintain global counter
+# Track active vehicles and maintain global counter
+# Track active vehicles and maintain global counter
         self.active_tracks = {}
-        self.completed_overtaking_ids = set()
-        self.overtaking_count = 0
+        self.completed_pass_ids = set()
+        self.pass_count = 0
+        self.previous_angles = {}
+        self.angle_history = {}
+        self.confirmed_passing = set()
+        self.potential_passing = {}
 
-        # Add angle tracking
-        self.previous_angles = {}           # track_id: previous_angle
-        self.angle_history = {}             # track_id: list of recent angles
-        self.min_angle_change = 2           # minimum angle change to consider as approaching
-        self.confirmed_overtaking = set()   # Set of confirmed overtaking vehicles
-
-    def is_valid_overtaking(self, track_id, detection_idx, detections, frame_width, frame_height, current_frame):
-        """Validate if detection represents an overtaking event"""
+    def is_valid_passing(self, track_id, detection_idx, detections, frame_width, frame_height, current_frame):
+        """Validate if detection represents a passing event"""
         # First check if it's in excluded range
         if self._is_frame_range_excluded(current_frame, current_frame):
             return False
@@ -109,7 +155,7 @@ class VehiclePassTracker:
         if track_id not in self.previous_angles:
             self.previous_angles[track_id] = current_angle
             self.angle_history[track_id] = [current_angle]
-            self.potential_overtaking[track_id] = 1
+            self.potential_passing[track_id] = 1
             return False
         
         # Update angle history
@@ -124,12 +170,12 @@ class VehiclePassTracker:
             significant_change = (angles[-1] - angles[0]) >= self.min_angle_change
             
             if is_increasing and significant_change:
-                self.potential_overtaking[track_id] = self.potential_overtaking.get(track_id, 0) + 1
+                self.potential_passing[track_id] = self.potential_passing.get(track_id, 0) + 1
                 # Only return true if we've seen enough consecutive valid frames
-                return self.potential_overtaking[track_id] >= self.min_frames_threshold
+                return self.potential_passing[track_id] >= self.min_frames_threshold
             
         # Reset counter if conditions not met
-        self.potential_overtaking[track_id] = 0
+        self.potential_passing[track_id] = 0
         return False
 
     def process_sequence(self):
@@ -166,8 +212,8 @@ class VehiclePassTracker:
 
             # Draw visualizations
             annotated_frame = draw_visualizations(frame, detections, current_frame, 
-                                               self.confirmed_overtaking, self.previous_angles, self.mode, self.image_source_position, 
-                                               self.overtaking_data, self.active_tracks)
+                                               self.confirmed_passing, self.previous_angles, self.mode, self.image_source_position, 
+                                               self.passing_data, self.active_tracks)
             
             # Save output frame
             output_path = os.path.join(self.output_image_folder, f'output_{current_frame}.jpg')
@@ -189,7 +235,7 @@ class VehiclePassTracker:
         self.save_to_csv()
 
     def process_tracks(self, detections, frame_width, current_frame):
-        """Process detected tracks and update overtaking events"""
+        """Process detected tracks and update passing events"""
         if len(detections) == 0:
             return
             
@@ -197,69 +243,69 @@ class VehiclePassTracker:
         active_ids_this_frame = set()
             
         for i, track_id in enumerate(detections.tracker_id):
-            # Pass current_frame to is_valid_overtaking
-            if self.is_valid_overtaking(track_id, i, detections, frame_width, frame_height, current_frame):
+            # Pass current_frame to is_valid_passing
+            if self.is_valid_passing(track_id, i, detections, frame_width, frame_height, current_frame):
                 active_ids_this_frame.add(track_id)
                 
                 if track_id not in self.active_tracks:
                     # Only start tracking if we have enough frames to be valid
-                    self.overtaking_count += 1
+                    self.pass_count += 1
                     self.active_tracks[track_id] = {
                         'first_frame': current_frame - self.min_frames_threshold + 1,
                         'last_seen': current_frame,
                         'vehicle_class': detections.class_id[i],
-                        'overtaking_id': self.overtaking_count
+                        'pass_id': self.pass_count
                     }
                     
                     # Only add to confirmed if it meets duration criteria
                     track_duration = current_frame - (current_frame - self.min_frames_threshold + 1)
                     if track_duration >= self.min_frames_threshold:
-                        self.confirmed_overtaking.add(track_id)
-                        print(f"Added track {track_id} to confirmed_overtaking at frame {current_frame}")
+                        self.confirmed_passing.add(track_id)
+                        print(f"Added track {track_id} to confirmed_passing at frame {current_frame}")
                 else:
                     # Update existing track
                     self.active_tracks[track_id]['last_seen'] = current_frame
                     
                     # Check if it should be confirmed
                     track_duration = current_frame - self.active_tracks[track_id]['first_frame']
-                    if track_duration >= self.min_frames_threshold and track_id not in self.confirmed_overtaking:
-                        self.confirmed_overtaking.add(track_id)
-                        print(f"Added track {track_id} to confirmed_overtaking at frame {current_frame}")
+                    if track_duration >= self.min_frames_threshold and track_id not in self.confirmed_passing:
+                        self.confirmed_passing.add(track_id)
+                        print(f"Added track {track_id} to confirmed_passing at frame {current_frame}")
         
         self._cleanup_tracks(active_ids_this_frame, current_frame)
 
     def _cleanup_tracks(self, active_ids_this_frame, current_frame):
-        """Clean up inactive tracks and record completed overtaking events"""
+        """Clean up inactive tracks and record completed passing events"""
         tracks_to_remove = []
         for track_id in self.active_tracks:
             if track_id not in active_ids_this_frame:
                 if current_frame - self.active_tracks[track_id]['last_seen'] > 30:  # 30 frames threshold
                     track_duration = self.active_tracks[track_id]['last_seen'] - self.active_tracks[track_id]['first_frame']
                     
-                    if (track_id in self.confirmed_overtaking and 
+                    if (track_id in self.confirmed_passing and 
                         track_duration >= self.min_frames_threshold and
                         not self._is_frame_range_excluded(
                             self.active_tracks[track_id]['first_frame'],
                             self.active_tracks[track_id]['last_seen']
                         )):
-                        self._record_overtaking_event(track_id)
+                        self._record_passing_event(track_id)
                     tracks_to_remove.append(track_id)
         
         for track_id in tracks_to_remove:
             self._remove_track(track_id)
 
-    def _record_overtaking_event(self, track_id):
-        """Record a completed overtaking event"""
+    def _record_passing_event(self, track_id):
+        """Record a completed passing event"""
         track_data = self.active_tracks[track_id]
-        overtaking_id = track_data['overtaking_id']
+        pass_id = track_data['pass_id']
         
-        self.overtaking_data['overtaking_id'].append(overtaking_id)
-        self.overtaking_data['track_id'].append(track_id)
-        self.overtaking_data['first_frame'].append(track_data['first_frame'])
-        self.overtaking_data['last_frame'].append(track_data['last_seen'])
-        self.overtaking_data['vehicle_class'].append(track_data['vehicle_class'])
+        self.passing_data['pass_id'].append(pass_id)
+        self.passing_data['track_id'].append(track_id)
+        self.passing_data['first_frame'].append(track_data['first_frame'])
+        self.passing_data['last_frame'].append(track_data['last_seen'])
+        self.passing_data['vehicle_class'].append(track_data['vehicle_class'])
         
-        self.completed_overtaking_ids.add(overtaking_id)
+        self.completed_pass_ids.add(pass_id)
 
     def _remove_track(self, track_id):
         """Remove a track and its associated data"""
@@ -268,10 +314,10 @@ class VehiclePassTracker:
             del self.previous_angles[track_id]
         if track_id in self.angle_history:
             del self.angle_history[track_id]
-        if track_id in self.confirmed_overtaking:
-            self.confirmed_overtaking.remove(track_id)
-        if track_id in self.potential_overtaking:
-            del self.potential_overtaking[track_id]
+        if track_id in self.confirmed_passing:
+            self.confirmed_passing.remove(track_id)
+        if track_id in self.potential_passing:
+            del self.potential_passing[track_id]
 
     def _is_frame_range_excluded(self, start_frame, end_frame):
         """Check if a frame range falls within excluded ranges"""
@@ -286,11 +332,11 @@ class VehiclePassTracker:
 
     def post_process_detections(self):
         """Post-process detected events to remove invalid detections"""
-        if not self.overtaking_data['track_id']:  # If no detections, return early
+        if not self.passing_data['track_id']:  # If no detections, return early
             return
 
         # Convert to DataFrame for easier processing
-        df = pd.DataFrame(self.overtaking_data)
+        df = pd.DataFrame(self.passing_data)
         
         # Apply filters:
         # 1. Remove detections that are too short
@@ -334,15 +380,15 @@ class VehiclePassTracker:
         df = pd.DataFrame(merged_detections)
 
         # Reset the data structures with filtered results
-        self.overtaking_data = {
-            'overtaking_id': df['overtaking_id'].tolist(),
+        self.passing_data = {
+            'pass_id': df['pass_id'].tolist(),
             'track_id': df['track_id'].tolist(),
             'first_frame': df['first_frame'].tolist(),
             'last_frame': df['last_frame'].tolist(),
             'vehicle_class': df['vehicle_class'].tolist()
         }
         
-        self.overtaking_count = len(df)
+        self.pass_count = len(df)
 
     def save_to_csv(self):
         """Post-process and save tracking results to CSV"""
@@ -350,8 +396,8 @@ class VehiclePassTracker:
         self.post_process_detections()
 
         # Convert to DataFrame and save
-        df = pd.DataFrame(self.overtaking_data)
+        df = pd.DataFrame(self.passing_data)
         csv_path = os.path.join(self.output_folder, 'vehicle_passing.csv')
         df.to_csv(csv_path, index=False)
         print(f"Results saved to: {csv_path}")
-        print(f"Total vehicle passing events detected: {self.overtaking_count}")
+        print(f"Total vehicle passing events detected: {self.pass_count}")
