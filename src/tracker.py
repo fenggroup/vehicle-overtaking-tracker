@@ -57,6 +57,14 @@ class VehiclePassTracker:
             config: Optional custom configuration
         """
         self.config = config or TrackerConfig()
+        
+        # Initialize configuration attributes
+        self.valid_classes = self.config.valid_vehicle_classes
+        self.min_frames_threshold = self.config.min_frames_threshold
+        self.tolerance_threshold = self.config.tolerance_threshold
+        self.confidence_threshold = self.config.confidence_threshold
+        self.min_angle_change = self.config.min_angle_change
+
         self._setup_paths(image_sequence_path, output_folder)
         self._initialize_models()
         
@@ -185,7 +193,7 @@ class VehiclePassTracker:
         sorted_image_sequence = get_sorted_images(self.image_sequence_path)
 
         # Initialize frame counter
-        current_frame = 1
+        current_frame = 1701
         
         for image in sorted_image_sequence:
             
@@ -254,7 +262,7 @@ class VehiclePassTracker:
                         'first_frame': current_frame - self.min_frames_threshold + 1,
                         'last_seen': current_frame,
                         'vehicle_class': detections.class_id[i],
-                        'pass_id': self.pass_count
+                        'passing_id': self.pass_count  # Changed from pass_id to passing_id
                     }
                     
                     # Only add to confirmed if it meets duration criteria
@@ -297,7 +305,7 @@ class VehiclePassTracker:
     def _record_passing_event(self, track_id):
         """Record a completed passing event"""
         track_data = self.active_tracks[track_id]
-        pass_id = track_data['pass_id']
+        pass_id = track_data['passing_id']  # Changed from pass_id to passing_id
         
         self.passing_data['pass_id'].append(pass_id)
         self.passing_data['track_id'].append(track_id)
