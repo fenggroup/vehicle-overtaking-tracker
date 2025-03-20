@@ -193,7 +193,7 @@ class VehiclePassTracker:
         sorted_image_sequence = get_sorted_images(self.image_sequence_path)
 
         # Initialize frame counter
-        current_frame = 1
+        current_frame = 0
         
         for image in sorted_image_sequence:
             
