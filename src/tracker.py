@@ -27,7 +27,7 @@ from ultralytics import YOLO
 import os
 
 from .visualization import draw_visualizations
-from .utils import calculate_angle, get_sorted_images
+from .utils import calculate_angle, get_sorted_images, get_class_name, setup_detailed_logger
 from .types import VehiclePassEvent, TrackerConfig
 
 # Configure logging
@@ -60,7 +60,8 @@ class VehiclePassTracker:
         
         # Initialize configuration attributes
         self.valid_classes = self.config.valid_vehicle_classes
-        self.min_frames_threshold = self.config.min_frames_threshold
+        self.min_passing_frames_threshold = self.config.min_passing_frames_threshold
+        self.buffer_frames = self.config.buffer_frames
         self.tolerance_threshold = self.config.tolerance_threshold
         self.confidence_threshold = self.config.confidence_threshold
         self.min_angle_change = self.config.min_angle_change
@@ -68,13 +69,44 @@ class VehiclePassTracker:
         self._setup_paths(image_sequence_path, output_folder)
         self._initialize_models()
         
+        # Clear any existing handlers
+        root_logger = logging.getLogger()
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+        
+        # Setup file logging
+        log_file = os.path.join(output_folder, 'tracking_debug.log')
+        file_handler = logging.FileHandler(log_file, mode='w')  # 'w' mode to start fresh
+        file_handler.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        
+        # Add console logging
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(formatter)
+        
+        # Configure root logger
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        root_logger.addHandler(file_handler)
+        root_logger.addHandler(console_handler)
+        
+        # Remove dual logging handlers
+        logging.getLogger('__main__').handlers = []
+        
+        # Setup detailed logging
+        self.log_buffer = setup_detailed_logger(output_folder)
+        
         # Algorithm settings
         self.mode = mode
         self.image_source_position = image_source_position
         self._load_exclusions(excluded_frames_path)
+        self.image_sequence_length = 0
         
         # Initialize tracking state
         self._initialize_tracking_storage()
+        self.current_angles = {}
 
     def _initialize_models(self) -> None:
         """Initialize detection and tracking models."""
@@ -118,58 +150,69 @@ class VehiclePassTracker:
             'track_id': [],
             'first_frame': [],
             'last_frame': [],
-            'vehicle_class': []
+            'vehicle_class': [],
+            'passing_frame': []
         }
 
-# Track active vehicles and maintain global counter
-# Track active vehicles and maintain global counter
         self.active_tracks = {}
         self.completed_pass_ids = set()
         self.pass_count = 0
         self.previous_angles = {}
         self.angle_history = {}
-        self.confirmed_passing = set()
-        self.potential_passing = {}
+        self.potential_passing = set()  # Tracks marked as potential passing
+        self.confirmed_passing = set()  # Tracks that have passed 20 degrees
+        self.current_angles = {}  # Current angles of active tracks
+        self.potential_passing_tracks = {}  # Track data for potential passings
+        self.confirmed_passing_frames = {}  # Store first frame of confirmed passing
 
     def is_valid_passing(self, track_id, detection_idx, detections, frame_width, frame_height, current_frame):
         """Validate if detection represents a passing event"""
-        # First check if it's in excluded range
+        # Check if it's in excluded range
         if self._is_frame_range_excluded(current_frame, current_frame):
             return False
-            
-        # Check if this track already has enough valid frames
-        if track_id in self.active_tracks:
-            track_duration = current_frame - self.active_tracks[track_id]['first_frame']
-            if track_duration < self.min_frames_threshold:
-                return False
+        
+        # Calculate reference points based on camera position
+        if self.image_source_position == 'bottom_center':
+            # Set confirmation point at 65% between center and right edge
+            confirmation_x = frame_width * 0.65
+        else:  # bottom_left
+            # Set confirmation point at center of image
+            confirmation_x = frame_width * 0.5
 
         # Get current position
         x1, y1, x2, y2 = detections.xyxy[detection_idx]
         center_x = (x1 + x2) / 2
-        center_y = (y1 + y2) / 2
+        center_y = (y1 + y2) / 2        
+        
+        # Calculate and store current angle
+        current_angle = calculate_angle(center_x, center_y, frame_height, frame_width, self.image_source_position)
+        self.current_angles[track_id] = current_angle
+        
+        logger.info(f"Frame {current_frame} - Track {track_id}: current_angle={current_angle:.2f}, "
+                    f"center_x={center_x:.2f}, center_y={center_y:.2f}, confirmation_x={confirmation_x:.2f}")
         
         # Check if it's a valid vehicle class
         if detections.class_id[detection_idx] not in self.valid_classes:
             return False
         
-        # Calculate current angle
-        current_angle = calculate_angle(center_x, center_y, frame_height, frame_width, self.image_source_position)
-        
         # Check if vehicle is in right half (angle between 0 and 90)
         if not (0 <= current_angle <= 90):
             return False
-        
-        # If no previous angle, store and wait for next frame
+            
+        # Initialize angle tracking for new vehicles
         if track_id not in self.previous_angles:
             self.previous_angles[track_id] = current_angle
             self.angle_history[track_id] = [current_angle]
-            self.potential_passing[track_id] = 1
             return False
         
-        # Update angle history
+        # Update and maintain angle history
         self.angle_history[track_id].append(current_angle)
         if len(self.angle_history[track_id]) > 5:
             self.angle_history[track_id].pop(0)
+        
+        if track_id not in self.potential_passing:
+            logger.debug(f"Track {track_id}: angle history len={len(self.angle_history[track_id])}, "
+                         f"angles={self.angle_history[track_id]}")
         
         # Check if angle is consistently increasing (moving left to right)
         if len(self.angle_history[track_id]) >= 3:
@@ -178,12 +221,25 @@ class VehiclePassTracker:
             significant_change = (angles[-1] - angles[0]) >= self.min_angle_change
             
             if is_increasing and significant_change:
-                self.potential_passing[track_id] = self.potential_passing.get(track_id, 0) + 1
-                # Only return true if we've seen enough consecutive valid frames
-                return self.potential_passing[track_id] >= self.min_frames_threshold
-            
-        # Reset counter if conditions not met
-        self.potential_passing[track_id] = 0
+                # Track new potential passing event
+                if track_id not in self.potential_passing:
+                    self.potential_passing.add(track_id)
+                    self.pass_count += 1
+                    self.potential_passing_tracks[track_id] = {
+                        'first_frame': current_frame,
+                        'last_seen': current_frame,
+                        'vehicle_class': detections.class_id[detection_idx],
+                        'passing_id': self.pass_count
+                    }
+                else:
+                    self.potential_passing_tracks[track_id]['last_seen'] = current_frame
+                
+                # Confirm passing based on horizontal position
+                if center_x >= confirmation_x and track_id not in self.confirmed_passing:
+                    self.confirmed_passing.add(track_id)
+                    self.confirmed_passing_frames[track_id] = current_frame
+                return True
+                
         return False
 
     def process_sequence(self):
@@ -192,55 +248,115 @@ class VehiclePassTracker:
         # Get sorted image sequence
         sorted_image_sequence = get_sorted_images(self.image_sequence_path)
 
+        self.image_sequence_length = len(sorted_image_sequence)
+
         # Initialize frame counter
         current_frame = 0
         
-        for image in sorted_image_sequence:
-            
-            # Read frame
-            frame_path = os.path.join(self.image_sequence_path, image)
-            frame = cv2.imread(frame_path)
-            if frame is None:
-                break
-            
-            # Get frame dimensions
-            frame_height, frame_width = frame.shape[:2]
+        try:
+            for image in sorted_image_sequence:
+                
+                # Read frame
+                frame_path = os.path.join(self.image_sequence_path, image)
+                frame = cv2.imread(frame_path)
+                if frame is None:
+                    break
+                
+                # Get frame dimensions
+                frame_height, frame_width = frame.shape[:2]
 
-            # Run YOLOv5 inference
-            results = self.model(frame, conf=0.4)[0]    # Confidence interval for YOLOv5 model is set to 40%
+                # Run YOLOv5 inference
+                results = self.model(frame, conf=self.confidence_threshold)[0]
 
-            # Convert detections to supervision format
-            detections = sv.Detections.from_ultralytics(results)
+                # Convert detections to supervision format
+                detections = sv.Detections.from_ultralytics(results)
+                
+                # Update tracks using the correct method
+                detections = self.tracker.update_with_detections(detections)
+                
+                # Log detection details
+                self._log_frame_details(current_frame, results, detections)
 
-            # Update tracks using the correct method
-            detections = self.tracker.update_with_detections(detections)
-            
-            # Process each track
-            self.process_tracks(detections, frame_width, current_frame)
+                # Process each track
+                self.process_tracks(detections, frame_width, current_frame)
 
-            # Draw visualizations
-            annotated_frame = draw_visualizations(frame, detections, current_frame, 
-                                               self.confirmed_passing, self.previous_angles, self.mode, self.image_source_position, 
-                                               self.passing_data, self.active_tracks)
-            
-            # Save output frame
-            output_path = os.path.join(self.output_image_folder, f'output_{current_frame}.jpg')
-            cv2.imwrite(output_path, annotated_frame)
-            
-            cv2.imshow("Vehicle Pass Tracker", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            
-            # Display progress in log
-            if current_frame % 100 == 0:
-                print(f"Processing frame: {current_frame}")
-            
-            current_frame += 1
-        
+                # Draw visualizations
+                annotated_frame = draw_visualizations(
+                    frame, detections, current_frame, 
+                    self.confirmed_passing,
+                    self.potential_passing,    
+                    self.current_angles,
+                    self.mode, 
+                    self.image_source_position, 
+                    self.potential_passing_tracks
+                )
+                
+                # Save output frame
+                output_path = os.path.join(self.output_image_folder, f'output_{current_frame}.jpg')
+                cv2.imwrite(output_path, annotated_frame)
+                
+                cv2.imshow("Vehicle Pass Tracker", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+                
+                # Display progress in log
+                if current_frame % 100 == 0:
+                    print(f"Processing frame: {current_frame}")
+                
+                # Force log flush every 10 frames
+                if current_frame % 10 == 0:
+                    for handler in logging.getLogger().handlers:
+                        handler.flush()
+                
+                current_frame += 1
+        finally:
+            # Ensure all logs are written
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+                
+            # Flush the log buffer
+            if hasattr(self, 'log_buffer'):
+                self.log_buffer.flush(force=True)
+
+        # Final cleanup
         cv2.destroyAllWindows()
 
         # Save tracking data to CSV
         self.save_to_csv()
+
+    def _log_frame_details(self, frame_number, yolo_results, detections):
+        """Log detailed information about the current frame"""
+        if len(detections) > 0 or self.potential_passing or self.confirmed_passing:
+            log_entry = []
+            log_entry.append(f"\nFrame {frame_number}:")
+            
+            # Log YOLO detections
+            if len(detections) > 0:
+                log_entry.append("  Detections:")
+                valid_indices = range(min(len(detections.class_id), 
+                                       len(yolo_results.boxes.conf)))
+                
+                for i in valid_indices:
+                    class_id = detections.class_id[i]
+                    if class_id in self.valid_classes:
+                        track_id = detections.tracker_id[i]
+                        class_name = get_class_name(class_id)
+                        conf = yolo_results.boxes.conf[i]
+                        log_entry.append(f"    - {class_name} "
+                                    f"(Detection #{i}, ByteTrack ID: {track_id}, "
+                                    f"Confidence: {conf:.2f})")
+            
+            # Log tracking status
+            if self.potential_passing:
+                log_entry.append("  Potential Passing ByteTrack IDs: " + 
+                               ", ".join(map(str, self.potential_passing)))
+            if self.confirmed_passing:
+                log_entry.append("  Confirmed Passing ByteTrack IDs: " + 
+                               ", ".join(map(str, self.confirmed_passing)))
+            
+            # Log directly using logger
+            message = "\n".join(log_entry)
+            logging.info(message)
 
     def process_tracks(self, detections, frame_width, current_frame):
         """Process detected tracks and update passing events"""
@@ -251,81 +367,76 @@ class VehiclePassTracker:
         active_ids_this_frame = set()
             
         for i, track_id in enumerate(detections.tracker_id):
-            # Pass current_frame to is_valid_passing
             if self.is_valid_passing(track_id, i, detections, frame_width, frame_height, current_frame):
                 active_ids_this_frame.add(track_id)
-                
-                if track_id not in self.active_tracks:
-                    # Only start tracking if we have enough frames to be valid
-                    self.pass_count += 1
-                    self.active_tracks[track_id] = {
-                        'first_frame': current_frame - self.min_frames_threshold + 1,
-                        'last_seen': current_frame,
-                        'vehicle_class': detections.class_id[i],
-                        'passing_id': self.pass_count  # Changed from pass_id to passing_id
-                    }
-                    
-                    # Only add to confirmed if it meets duration criteria
-                    track_duration = current_frame - (current_frame - self.min_frames_threshold + 1)
-                    if track_duration >= self.min_frames_threshold:
-                        self.confirmed_passing.add(track_id)
-                        print(f"Added track {track_id} to confirmed_passing at frame {current_frame}")
-                else:
-                    # Update existing track
-                    self.active_tracks[track_id]['last_seen'] = current_frame
-                    
-                    # Check if it should be confirmed
-                    track_duration = current_frame - self.active_tracks[track_id]['first_frame']
-                    if track_duration >= self.min_frames_threshold and track_id not in self.confirmed_passing:
-                        self.confirmed_passing.add(track_id)
-                        print(f"Added track {track_id} to confirmed_passing at frame {current_frame}")
+                # Update last_seen frame whenever the track is active
+                if track_id in self.potential_passing_tracks:
+                    self.potential_passing_tracks[track_id]['last_seen'] = current_frame
         
         self._cleanup_tracks(active_ids_this_frame, current_frame)
 
     def _cleanup_tracks(self, active_ids_this_frame, current_frame):
         """Clean up inactive tracks and record completed passing events"""
         tracks_to_remove = []
-        for track_id in self.active_tracks:
+        for track_id in list(self.potential_passing_tracks.keys()):
+            track_data = self.potential_passing_tracks[track_id]
+            # Remove tracks that have been inactive for 30 frames
             if track_id not in active_ids_this_frame:
-                if current_frame - self.active_tracks[track_id]['last_seen'] > 30:  # 30 frames threshold
-                    track_duration = self.active_tracks[track_id]['last_seen'] - self.active_tracks[track_id]['first_frame']
-                    
-                    if (track_id in self.confirmed_passing and 
-                        track_duration >= self.min_frames_threshold and
-                        not self._is_frame_range_excluded(
-                            self.active_tracks[track_id]['first_frame'],
-                            self.active_tracks[track_id]['last_seen']
-                        )):
-                        self._record_passing_event(track_id)
+                if current_frame - track_data['last_seen'] > 30:
+                    if track_id in self.confirmed_passing:
+                        # Pass the last_seen frame directly from track_data
+                        self._record_passing_event(track_id, True)
                     tracks_to_remove.append(track_id)
         
+        # Clean up removed tracks
         for track_id in tracks_to_remove:
             self._remove_track(track_id)
 
-    def _record_passing_event(self, track_id):
+    def _record_passing_event(self, track_id, was_confirmed=False):
         """Record a completed passing event"""
-        track_data = self.active_tracks[track_id]
-        pass_id = track_data['passing_id']  # Changed from pass_id to passing_id
+        track_data = self.potential_passing_tracks[track_id]  
+              
+        # Only record confirmed passings in final CSV
+        if not was_confirmed:
+            return
+            
+        first_frame = track_data['first_frame']
+        last_frame = track_data['last_seen']
         
-        self.passing_data['pass_id'].append(pass_id)
-        self.passing_data['track_id'].append(track_id)
-        self.passing_data['first_frame'].append(track_data['first_frame'])
-        self.passing_data['last_frame'].append(track_data['last_seen'])
-        self.passing_data['vehicle_class'].append(track_data['vehicle_class'])
+        if last_frame - first_frame <= self.min_passing_frames_threshold:
+            return
+            
+        event = VehiclePassEvent(
+            pass_id=track_data['passing_id'],
+            track_id=track_id,
+            first_frame=first_frame,
+            last_frame=last_frame,
+            vehicle_class=track_data['vehicle_class'],
+            passing_frame=self.confirmed_passing_frames.get(track_id, -1)
+        )
         
-        self.completed_pass_ids.add(pass_id)
+        # Update passing_data dictionary
+        self.passing_data['pass_id'].append(event.pass_id)
+        self.passing_data['track_id'].append(event.track_id)
+        self.passing_data['first_frame'].append(event.first_frame)
+        self.passing_data['last_frame'].append(event.last_frame)
+        self.passing_data['passing_frame'].append(event.passing_frame)
+        self.passing_data['vehicle_class'].append(event.vehicle_class)
+        
+        logger.info(f"Recorded confirmed passing event for track {track_id}")
 
     def _remove_track(self, track_id):
         """Remove a track and its associated data"""
-        del self.active_tracks[track_id]
+        if track_id in self.potential_passing_tracks:
+            del self.potential_passing_tracks[track_id]
         if track_id in self.previous_angles:
             del self.previous_angles[track_id]
         if track_id in self.angle_history:
             del self.angle_history[track_id]
+        if track_id in self.potential_passing:
+            self.potential_passing.remove(track_id)
         if track_id in self.confirmed_passing:
             self.confirmed_passing.remove(track_id)
-        if track_id in self.potential_passing:
-            del self.potential_passing[track_id]
 
     def _is_frame_range_excluded(self, start_frame, end_frame):
         """Check if a frame range falls within excluded ranges"""
@@ -346,11 +457,7 @@ class VehiclePassTracker:
         # Convert to DataFrame for easier processing
         df = pd.DataFrame(self.passing_data)
         
-        # Apply filters:
-        # 1. Remove detections that are too short
-        df = df[df['last_frame'] - df['first_frame'] >= self.min_frames_threshold]
-
-        # 2. Remove detections in excluded ranges
+        # Remove detections in excluded ranges
         if self.excluded_ranges is not None:
             valid_detections = []
             for idx, row in df.iterrows():
@@ -358,7 +465,7 @@ class VehiclePassTracker:
                     valid_detections.append(idx)
             df = df.loc[valid_detections]
 
-        # 3. Merge overlapping events only if they belong to the same track_id
+        # Merge overlapping events only if they belong to the same track_id
         sorted_df = df.sort_values(['track_id', 'first_frame'])
         merged_detections = []
         
@@ -373,7 +480,7 @@ class VehiclePassTracker:
                 
                 while j < len(group_rows):
                     next_det = group_rows[j]
-                    # Only merge if it's the same track_id
+                    # Only merge if it's the same track_id and frames are within tolerance
                     if (next_det['track_id'] == current['track_id'] and 
                         next_det['first_frame'] <= current['last_frame'] + self.tolerance_threshold):
                         current['last_frame'] = max(current['last_frame'], next_det['last_frame'])
@@ -381,6 +488,9 @@ class VehiclePassTracker:
                     else:
                         break
                         
+                # Add buffer frames
+                current['first_frame'] = max(0, current['first_frame'] - self.buffer_frames)
+                current['last_frame'] = min(current['last_frame'] + self.buffer_frames, self.image_sequence_length - 1)
                 merged_detections.append(current)
                 i = j
         
@@ -393,6 +503,7 @@ class VehiclePassTracker:
             'track_id': df['track_id'].tolist(),
             'first_frame': df['first_frame'].tolist(),
             'last_frame': df['last_frame'].tolist(),
+            'passing_frame': df['passing_frame'].tolist(),
             'vehicle_class': df['vehicle_class'].tolist()
         }
         
@@ -403,9 +514,11 @@ class VehiclePassTracker:
         # Apply post-processing
         self.post_process_detections()
 
-        # Convert to DataFrame and save
+        # Convert to DataFrame and sort by last_frame
         df = pd.DataFrame(self.passing_data)
+        df = df.sort_values('last_frame')
+        
         csv_path = os.path.join(self.output_folder, 'vehicle_passing.csv')
         df.to_csv(csv_path, index=False)
         print(f"Results saved to: {csv_path}")
-        print(f"Total vehicle passing events detected: {self.pass_count}")
+        print(f"Total confirmed vehicle passing events: {len(df)}")

@@ -40,20 +40,23 @@ def get_reference_point(frame_height, frame_width, refn='bottom_center'):
 
 def calculate_angle(x, y, frame_height, frame_width, image_source_position):
     """
-    Calculate angle between vehicle position and bottom center reference
+    Calculate angle between vehicle position and reference point
     Returns angle in degrees where:
     - 0 degrees is straight up from bottom center
     - Positive angles towards the right side (0 to 90)
     """
-    # Reference point is bottom center of frame
+    # Get reference point based on camera position
     ref_x, ref_y = get_reference_point(frame_height, frame_width, image_source_position)
-
-    # Calculate relative position
+    
+    # Calculate vector components from reference to vehicle
     dx = x - ref_x
-    dy = ref_y - y      # Inverted because y increases downward in image
-
-    # Return angle in degrees
-    return np.degrees(np.arctan2(dx, dy))
+    dy = ref_y - y  # Inverted because y increases downward in image
+    
+    # Calculate angle using arctan2 for correct quadrant handling
+    angle = np.degrees(np.arctan2(dx, dy))
+    
+    # Normalize angle to 0-90 range for right side passing
+    return angle if 0 <= angle <= 90 else -1
 
 def images_to_video(image_folder: str, 
                    start_frame: int, 
@@ -110,3 +113,24 @@ def log_timing(output_folder, sequence_name, start_time, end_time):
         f.write(f'End time: {datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S")}\n')
         f.write(f'Duration: {end_time - start_time:.2f} seconds\n\n')
         print(end_time)
+
+def setup_detailed_logger(output_folder):
+    """Setup detailed algorithm logger"""
+    log_path = os.path.join(output_folder, 'algorithm_log.txt')
+    
+    # Create a string buffer to store logs
+    class LogBuffer:
+        def __init__(self, filepath):
+            self.buffer = []
+            self.filepath = filepath
+        
+        def write(self, message):
+            self.buffer.append(message)
+            
+        def flush(self, force=False):
+            if force or len(self.buffer) >= 1000:  # Flush every 1000 entries or when forced
+                with open(self.filepath, 'a', encoding='utf-8') as f:
+                    f.write(''.join(self.buffer))
+                self.buffer = []
+    
+    return LogBuffer(log_path)

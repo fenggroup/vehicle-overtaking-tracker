@@ -13,11 +13,13 @@ class VehiclePassEvent:
     first_frame: int
     last_frame: int
     vehicle_class: int
+    passing_frame: int
 
 @dataclass
 class TrackerConfig:
     """Configuration parameters for vehicle tracking."""
-    min_frames_threshold: int = 5
+    min_passing_frames_threshold: int = 1
+    buffer_frames: int = 5
     tolerance_threshold: int = 10
     confidence_threshold: float = 0.4
     cleanup_frames: int = 30
