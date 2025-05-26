@@ -11,7 +11,7 @@ Overtaking Frame,Lane
 1613,2nd Adj. Lane
 1736,2nd Adj. Lane
 1751,1st Adj. Lane
-1760,1st Adj. Lane
+1770,1st Adj. Lane
 1795,1st Adj. Lane
 1814,2nd Adj. Lane
 1887,2nd Adj. Lane
@@ -41,7 +41,7 @@ Overtaking Frame,Lane
 6681,1st Adj. Lane
 6696,2nd Adj. Lane
 6741,1st Adj. Lane
-6740,2nd Adj. Lane
+6744,2nd Adj. Lane
 6780,2nd Adj. Lane
 6790,1st Adj. Lane
 6803,2nd Adj. Lane
@@ -53,7 +53,6 @@ Overtaking Frame,Lane
 7096,1st Adj. Lane
 7311,2nd Adj. Lane
 7355,2nd Adj. Lane
-7632,2nd Adj. Lane
 7681,2nd Adj. Lane
 7775,2nd Adj. Lane
 8163,2nd Adj. Lane
@@ -168,6 +167,7 @@ Overtaking Frame,Lane
 23922,2nd Adj. Lane
 23933,1st Adj. Lane
 23974,1st Adj. Lane
+23974,2nd Adj. Lane
 24031,2nd Adj. Lane
 24080,1st Adj. Lane
 24425,2nd Adj. Lane
