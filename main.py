@@ -8,7 +8,7 @@ import logging
 import time
 
 from src.tracker import VehiclePassTracker
-from src.types import TrackerConfig
+from src.tracker_types import TrackerConfig
 from src.utils import log_timing
 
 # Configure logging

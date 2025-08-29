@@ -28,7 +28,7 @@ import os
 
 from .visualization import draw_visualizations
 from .utils import calculate_angle, get_sorted_images, get_class_name, setup_detailed_logger
-from .types import VehiclePassEvent, TrackerConfig
+from .tracker_types import VehiclePassEvent, TrackerConfig
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -173,11 +173,11 @@ class VehiclePassTracker:
         
         # Calculate reference points based on camera position
         if self.image_source_position == 'bottom_center':
-            # Set confirmation point at 65% between center and right edge
+            # Set confirmation point at 85% of the frame width
+            confirmation_x = frame_width * 0.85
+        else: # bottom_left
+            # Set confirmation point at 65% of the frame width
             confirmation_x = frame_width * 0.65
-        else:  # bottom_left
-            # Set confirmation point at center of image
-            confirmation_x = frame_width * 0.5
 
         # Get current position
         x1, y1, x2, y2 = detections.xyxy[detection_idx]
@@ -189,13 +189,13 @@ class VehiclePassTracker:
         self.current_angles[track_id] = current_angle
         
         logger.info(f"Frame {current_frame} - Track {track_id}: current_angle={current_angle:.2f}, "
-                    f"center_x={center_x:.2f}, center_y={center_y:.2f}, confirmation_x={confirmation_x:.2f}")
+                    f"center_x={center_x:.2f}, center_y={center_y:.2f}, right_x={x2:.2f}, confirmation_x={confirmation_x:.2f}")
         
         # Check if it's a valid vehicle class
         if detections.class_id[detection_idx] not in self.valid_classes:
             return False
         
-        # Check if vehicle is in right half (angle between 0 and 90)
+        # Check if vehicle is in right half of the frame (left to the bicycle)
         if not (0 <= current_angle <= 90):
             return False
             
@@ -234,8 +234,8 @@ class VehiclePassTracker:
                 else:
                     self.potential_passing_tracks[track_id]['last_seen'] = current_frame
                 
-                # Confirm passing based on horizontal position
-                if center_x >= confirmation_x and track_id not in self.confirmed_passing:
+                # Confirm passing based on right edge of bounding box position
+                if x2 >= confirmation_x and track_id not in self.confirmed_passing:
                     self.confirmed_passing.add(track_id)
                     self.confirmed_passing_frames[track_id] = current_frame
                 return True
@@ -271,7 +271,7 @@ class VehiclePassTracker:
                 # Convert detections to supervision format
                 detections = sv.Detections.from_ultralytics(results)
                 
-                # Update tracks using the correct method
+                # Update tracks with ByteTrack results
                 detections = self.tracker.update_with_detections(detections)
                 
                 # Log detection details
@@ -369,10 +369,45 @@ class VehiclePassTracker:
         for i, track_id in enumerate(detections.tracker_id):
             if self.is_valid_passing(track_id, i, detections, frame_width, frame_height, current_frame):
                 active_ids_this_frame.add(track_id)
+            
+                # Store measurements only when track is first confirmed (at passing frame)
+                if track_id in self.confirmed_passing and track_id in self.confirmed_passing_frames and self.confirmed_passing_frames[track_id] == current_frame:
+                    x1, y1, x2, y2 = detections.xyxy[i]
+                    center_x = (x1 + x2) / 2
+                    center_y = (y1 + y2) / 2
+                
+                # Get reference point based on camera position
+                if self.image_source_position == 'bottom_center':
+                    ref_x = frame_width // 2
+                    ref_y = frame_height - 5
+                else: # bottom_left
+                    ref_x = 0
+                    ref_y = frame_height - 5
+                
+                # Calculate distance and angle
+                ref_point_distance = ((center_x - ref_x)**2 + (center_y - ref_y)**2)**0.5
+                passing_angle = calculate_angle(center_x, center_y, frame_height, frame_width, self.image_source_position)
+                
+                # Store measurements in track data
+                self.potential_passing_tracks[track_id].update({
+                'ref_point_distance': ref_point_distance,
+                'passing_angle': passing_angle,
+                'bbox_x1': x1,
+                'bbox_y1': y1,
+                'bbox_x2': x2,
+                'bbox_y2': y2
+                })
+                
+                logger.info(f"Stored measurements for track {track_id} at passing frame {current_frame}:")
+                logger.info(f"  bbox_coordinates: ({x1:.2f}, {y1:.2f}, {x2:.2f}, {y2:.2f})")
+                logger.info(f"  ref_point_distance: {ref_point_distance:.2f}")
+                logger.info(f"  passing_angle: {passing_angle:.2f}")
+            
                 # Update last_seen frame whenever the track is active
                 if track_id in self.potential_passing_tracks:
                     self.potential_passing_tracks[track_id]['last_seen'] = current_frame
         
+        # Cleanup inactive tracks in one pass
         self._cleanup_tracks(active_ids_this_frame, current_frame)
 
     def _cleanup_tracks(self, active_ids_this_frame, current_frame):
@@ -406,23 +441,39 @@ class VehiclePassTracker:
         if last_frame - first_frame <= self.min_passing_frames_threshold:
             return
             
+        # Get the passing frame from confirmed_passing_frames
+        passing_frame = self.confirmed_passing_frames.get(track_id, -1)
+            
+        # Create event with stored measurements
         event = VehiclePassEvent(
             pass_id=track_data['passing_id'],
             track_id=track_id,
             first_frame=first_frame,
             last_frame=last_frame,
             vehicle_class=track_data['vehicle_class'],
-            passing_frame=self.confirmed_passing_frames.get(track_id, -1)
+            passing_frame=passing_frame,
+            ref_point_distance=track_data.get('ref_point_distance', 0),
+            passing_angle=track_data.get('passing_angle', 0),
+            bbox_x1=track_data.get('bbox_x1', 0),
+            bbox_y1=track_data.get('bbox_y1', 0),
+            bbox_x2=track_data.get('bbox_x2', 0),
+            bbox_y2=track_data.get('bbox_y2', 0)
         )
-        
-        # Update passing_data dictionary
+            
+            # Update passing_data dictionary
         self.passing_data['pass_id'].append(event.pass_id)
         self.passing_data['track_id'].append(event.track_id)
         self.passing_data['first_frame'].append(event.first_frame)
         self.passing_data['last_frame'].append(event.last_frame)
         self.passing_data['passing_frame'].append(event.passing_frame)
         self.passing_data['vehicle_class'].append(event.vehicle_class)
-        
+        self.passing_data['ref_point_distance'].append(event.ref_point_distance)
+        self.passing_data['passing_angle'].append(event.passing_angle)
+        self.passing_data['bbox_x1'].append(event.bbox_x1)
+        self.passing_data['bbox_y1'].append(event.bbox_y1)
+        self.passing_data['bbox_x2'].append(event.bbox_x2)
+        self.passing_data['bbox_y2'].append(event.bbox_y2)
+            
         logger.info(f"Recorded confirmed passing event for track {track_id}")
 
     def _remove_track(self, track_id):
@@ -504,7 +555,13 @@ class VehiclePassTracker:
             'first_frame': df['first_frame'].tolist(),
             'last_frame': df['last_frame'].tolist(),
             'passing_frame': df['passing_frame'].tolist(),
-            'vehicle_class': df['vehicle_class'].tolist()
+            'vehicle_class': df['vehicle_class'].tolist(),
+            'ref_point_distance': df['ref_point_distance'].tolist(),
+            'passing_angle': df['passing_angle'].tolist(),
+            'bbox_x1': df['bbox_x1'].tolist(),
+            'bbox_y1': df['bbox_y1'].tolist(),
+            'bbox_x2': df['bbox_x2'].tolist(),
+            'bbox_y2': df['bbox_y2'].tolist()
         }
         
         self.pass_count = len(df)
