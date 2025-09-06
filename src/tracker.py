@@ -151,7 +151,13 @@ class VehiclePassTracker:
             'first_frame': [],
             'last_frame': [],
             'vehicle_class': [],
-            'passing_frame': []
+            'passing_frame': [],
+            'ref_point_distance': [],
+            'passing_angle': [],
+            'bbox_x1': [],
+            'bbox_y1': [],
+            'bbox_x2': [],
+            'bbox_y2': []
         }
 
         self.active_tracks = {}
@@ -376,32 +382,32 @@ class VehiclePassTracker:
                     center_x = (x1 + x2) / 2
                     center_y = (y1 + y2) / 2
                 
-                # Get reference point based on camera position
-                if self.image_source_position == 'bottom_center':
-                    ref_x = frame_width // 2
-                    ref_y = frame_height - 5
-                else: # bottom_left
-                    ref_x = 0
-                    ref_y = frame_height - 5
-                
-                # Calculate distance and angle
-                ref_point_distance = ((center_x - ref_x)**2 + (center_y - ref_y)**2)**0.5
-                passing_angle = calculate_angle(center_x, center_y, frame_height, frame_width, self.image_source_position)
-                
-                # Store measurements in track data
-                self.potential_passing_tracks[track_id].update({
-                'ref_point_distance': ref_point_distance,
-                'passing_angle': passing_angle,
-                'bbox_x1': x1,
-                'bbox_y1': y1,
-                'bbox_x2': x2,
-                'bbox_y2': y2
-                })
-                
-                logger.info(f"Stored measurements for track {track_id} at passing frame {current_frame}:")
-                logger.info(f"  bbox_coordinates: ({x1:.2f}, {y1:.2f}, {x2:.2f}, {y2:.2f})")
-                logger.info(f"  ref_point_distance: {ref_point_distance:.2f}")
-                logger.info(f"  passing_angle: {passing_angle:.2f}")
+                    # Get reference point based on camera position
+                    if self.image_source_position == 'bottom_center':
+                        ref_x = frame_width // 2
+                        ref_y = frame_height - 5
+                    else: # bottom_left
+                        ref_x = 0
+                        ref_y = frame_height - 5
+                    
+                    # Calculate distance and angle
+                    ref_point_distance = ((center_x - ref_x)**2 + (center_y - ref_y)**2)**0.5
+                    passing_angle = calculate_angle(center_x, center_y, frame_height, frame_width, self.image_source_position)
+                    
+                    # Store measurements in track data
+                    self.potential_passing_tracks[track_id].update({
+                    'ref_point_distance': ref_point_distance,
+                    'passing_angle': passing_angle,
+                    'bbox_x1': x1,
+                    'bbox_y1': y1,
+                    'bbox_x2': x2,
+                    'bbox_y2': y2
+                    })
+                    
+                    logger.info(f"Stored measurements for track {track_id} at passing frame {current_frame}:")
+                    logger.info(f"  bbox_coordinates: ({x1:.2f}, {y1:.2f}, {x2:.2f}, {y2:.2f})")
+                    logger.info(f"  ref_point_distance: {ref_point_distance:.2f}")
+                    logger.info(f"  passing_angle: {passing_angle:.2f}")
             
                 # Update last_seen frame whenever the track is active
                 if track_id in self.potential_passing_tracks:

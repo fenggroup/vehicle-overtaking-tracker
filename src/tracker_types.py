@@ -33,5 +33,5 @@ class TrackerConfig:
  valid_vehicle_classes: List[int] = None # car, motorcycle, bus, truck
 
  def __post_init__(self):
- if self.valid_vehicle_classes is None:
- self.valid_vehicle_classes = [2, 3, 5, 7]
+    if self.valid_vehicle_classes is None:
+        self.valid_vehicle_classes = [2, 3, 5, 7]

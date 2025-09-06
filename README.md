@@ -16,8 +16,8 @@ A computer vision system for detecting and analyzing vehicle passing events from
 - Multi-object tracking with ByteTrack
 - Real-time visualization and event logging
 - Support for multiple camera positions
-- Flexible input image formats
 - CSV export of detected events
+- Jupyter notebook for interactive analysis (`vehicle_pass_tracker_analysis.ipynb`)
 
 ## Quick Start
 
@@ -86,7 +86,7 @@ tracker = VehiclePassTracker(
 )
 ```
 
-### Customizable Parameters (in types.py)
+### Customizable Parameters (in tracker_types.py)
 ```python
 class TrackerConfig:
     min_frames_threshold: int = 5
@@ -134,7 +134,7 @@ tracker.process_sequence()
 ### 2. Advanced Configuration
 ```python
 from src.tracker import VehiclePassTracker
-from src.types import TrackerConfig
+from src.tracker_types import TrackerConfig
 
 # Custom configuration
 config = TrackerConfig(
@@ -166,9 +166,9 @@ tracker = VehiclePassTracker(
 ## Parameter Tuning Guide
 
 ### Detection Quality
-- Increase `confidence_threshold` to reduce false positives
-- Decrease it to detect distant/partially visible vehicles
-- Default: 0.4 (good balance for most cases)
+- Increase `confidence_threshold` for fewer false positives
+- Decrease for better detection of distant vehicles
+- Default: 0.4 (optimized based on validation)
 
 ### Event Validation
 - `min_frames_threshold`: Higher values (>5) for more reliable detection
@@ -192,6 +192,11 @@ tracker = VehiclePassTracker(
 - Reduce min_frames_threshold
 - Check excluded frames
 
+### Processing Speed
+- Enable GPU acceleration when available
+- Adjust frame processing rate if needed
+- Optimize image resolution for your use case
+
 ## Contributing
 
 We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
@@ -202,7 +207,7 @@ If you use this software in your research, please cite:
 ```bibtex
 @software{vehicle_pass_tracker,
   author = {Padmanaban, Gandhimathi and Feng, Fred},
-  title = {Vehicle Pass Tracker: An Automated Vehicle Passing Event Detection System},
+  title = {Vehicle Pass Tracker: An Automated Overtaking Event Event Detection System},
   year = {2025},
   publisher = {GitHub},
   url = {https://github.com/fenggroup/vehicle-pass-tracker.git}
@@ -219,6 +224,7 @@ vehicle-pass-tracker/
 │   ├── inference_images/    # Annotated output frames
 │   └── vehicle_passing.csv  # Detection results
 └── src/                     # Source code
+└── *.ipynb                   # Analysis scripts
 ```
 
 ## Troubleshooting
@@ -229,5 +235,16 @@ vehicle-pass-tracker/
 - On macOS, grant necessary permissions if using protected directories
 - Use forward slashes (/) in paths for cross-platform compatibility
 
+
 ## License
 MIT License - See LICENSE file for details
+
+## Support
+
+For issues and questions:
+1. Check the [Issues](https://github.com/fenggroup/vehicle-pass-tracker/issues) page
+2. Review common problems in Troubleshooting section
+3. Open a new issue with:
+   - System details
+   - Error messages
+   - Sample data (if possible)
