@@ -1,6 +1,6 @@
-# Vehicle Pass Tracker
+# Vehicle Overtaking Tracker
 
-A computer vision system for detecting and analyzing vehicle passing events from image sequences. The system combines deep learning-based object detection (YOLOv5) with computer vision tracking (ByteTrack) and geometric analysis for robust passing event validation.
+A computer vision system for detecting and analyzing vehicle overtaking events from image sequences. The system combines deep learning-based object detection (YOLOv5) with computer vision tracking (ByteTrack) and geometric analysis for robust passing event validation.
 
 ## System Requirements
 - Python 3.8+
@@ -100,14 +100,13 @@ class TrackerConfig:
 ### CSV Output (vehicle_passing.csv)
 ```csv
 pass_id,track_id,first_frame,last_frame,vehicle_class
-1,145,1500,1530,2  # Car passing event
-2,146,1600,1625,3  # Motorcycle passing event
+1,145,1500,1530,2  # Car overtaking event
 ```
 Columns:
-- pass_id: Unique identifier for each passing event
+- pass_id: Unique identifier for each overtaking event
 - track_id: Internal tracking ID
-- first_frame: Start frame of passing event
-- last_frame: End frame of passing event
+- first_frame: Start frame of overtaking event
+- last_frame: End frame of overtaking event
 - vehicle_class: Vehicle type (2:Car, 3:Motorcycle, 5:Bus, 7:Truck)
 
 ### Visualizations
@@ -242,7 +241,7 @@ MIT License - See LICENSE file for details
 ## Support
 
 For issues and questions:
-1. Check the [Issues](https://github.com/fenggroup/vehicle-pass-tracker/issues) page
+1. Check the [Issues](https://github.com/fenggroup/vehicle-overtaking-tracker/issues) page
 2. Review common problems in Troubleshooting section
 3. Open a new issue with:
    - System details
