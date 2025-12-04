@@ -21,18 +21,25 @@ logger = logging.getLogger(__name__)
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Vehicle Pass Tracker')
-    parser.add_argument('--input', type=str, required=True,
+    parser.add_argument('--input', type=str, default='./data/input_trip',
                       help='Path to input image sequence folder')
     parser.add_argument('--output', type=str, default='./results',
                       help='Path to output folder')
     parser.add_argument('--mode', type=str, default='demo',
                       choices=['demo', 'debug'], help='Operation mode')
     parser.add_argument('--camera-position', type=str, 
-                      default='bottom_center',
+                      default='bottom_left',
                       choices=['bottom_center', 'bottom_left'],
                       help='Camera position reference')
     parser.add_argument('--excluded-frames', type=str,
                       help='Optional CSV file with frames to exclude')
+    parser.add_argument('--onnx-model', type=str, default='rtdetr.onnx',
+                      help='Path to RT-DETR ONNX model file')
+    parser.add_argument('--no-display', action='store_true',
+                      help='Run in headless mode (no visualization window)')
+    parser.add_argument('--output-format', type=str, default='png',
+                      choices=['png', 'jpg'],
+                      help='Output image format: png (lossless, larger) or jpg (compressed, smaller)')
     return parser.parse_args()
 
 def main():    
@@ -49,12 +56,18 @@ def main():
         output_folder=args.output,
         mode=args.mode,
         image_source_position=args.camera_position,
-        excluded_frames_path=args.excluded_frames
+        excluded_frames_path=args.excluded_frames,
+        onnx_model_path=args.onnx_model,
+        display=not args.no_display,
+        output_format=args.output_format
     )
     
     tracker.process_sequence()
     end_time = time.time()
-    log_timing(args.output, 'Vehicle Passing Analysis', start_time, end_time)
+    
+    # Log timing with frame count
+    frame_count = tracker.image_sequence_length
+    log_timing(args.output, 'Vehicle Overtaking Analysis', start_time, end_time, frame_count)
     logger.info("Processing complete")
 
 if __name__ == "__main__":
