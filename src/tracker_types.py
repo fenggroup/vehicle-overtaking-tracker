@@ -2,8 +2,7 @@
 Type definitions and dataclasses for the vehicle pass tracker.
 """
 from dataclasses import dataclass
-from typing import Dict, List, Set, Optional
-import numpy as np
+from typing import List
 
 @dataclass
 class VehiclePassEvent:
@@ -23,15 +22,40 @@ class VehiclePassEvent:
  
 @dataclass
 class TrackerConfig:
- """Configuration parameters for vehicle tracking."""
- min_passing_frames_threshold: int = 1
- buffer_frames: int = 5
- tolerance_threshold: int = 10
- confidence_threshold: float = 0.4
- cleanup_frames: int = 30
- min_angle_change: float = 2.0
- valid_vehicle_classes: List[int] = None # car, motorcycle, bus, truck
+    """Configuration parameters for vehicle tracking and overtaking detection."""
+    
+    # Detection parameters
+    confidence_threshold: float = 0.4  # Minimum confidence for RT-DETR detections
+    valid_vehicle_classes: List[int] = None  # COCO classes: car=2, motorcycle=3, bus=5, truck=7
+    
+    # Angle-based filtering
+    min_angle: float = 0.0  # Minimum angle (degrees) for valid detections
+    max_angle: float = 90.0  # Maximum angle (degrees) for valid detections
+    min_angle_slope: float = 0.7  # Minimum angle increase rate (deg/frame) for overtaking
+    min_angle_increase_count: int = 5  # Minimum number of frames with angle increase (out of history window)
+    angle_trend_threshold: float = 0.5  # Threshold for detecting increasing/decreasing angle trends (deg/frame)
+    
+    # Bounding box growth filtering
+    min_bbox_growth_rate: float = 100.0  # Minimum bbox area growth rate (px²/frame) for approaching vehicles
+    
+    # History and evaluation windows
+    history_window_size: int = 10  # Number of frames to retain in angle/position history
+    min_frames_for_evaluation: int = 7  # Minimum frames required before evaluating overtaking criteria
+    probation_frames: int = 2  # Number of consecutive frames required to pass all checks before marking as potential passing
+    
+    # Confirmation line positions (fraction of frame width)
+    confirmation_line_bottom_center: float = 0.85  # Confirmation line for bottom_center camera position
+    confirmation_line_bottom_left: float = 0.65  # Confirmation line for bottom_left camera position
+    
+    # Event management
+    cleanup_frames: int = 30  # Number of frames of inactivity before removing a track
+    buffer_frames: int = 5  # Buffer frames added to event boundaries during post-processing
+    tolerance_threshold: int = 10  # Tolerance for merging overlapping events (frames)
+    
+    # Legacy parameters (kept for backwards compatibility, not used in simplified algorithm)
+    min_passing_frames_threshold: int = 1  # Deprecated: use probation_frames instead
+    min_angle_change: float = 2.0  # Deprecated: use min_angle_slope instead
 
- def __post_init__(self):
-    if self.valid_vehicle_classes is None:
-        self.valid_vehicle_classes = [2, 3, 5, 7]
+    def __post_init__(self):
+        if self.valid_vehicle_classes is None:
+            self.valid_vehicle_classes = [2, 3, 5, 7]  # car, motorcycle, bus, truck

@@ -2,7 +2,7 @@
 Core implementation of vehicle passing detection and tracking.
 
 This module provides the main VehiclePassTracker class that implements:
-- Vehicle detection using YOLOv5
+- Vehicle detection using RT-DETR via ONNX Runtime
 - Object tracking with ByteTrack
 - Angle-based passing event validation
 - Event logging and visualization
@@ -11,30 +11,34 @@ Example:
     tracker = VehiclePassTracker(
         image_sequence_path='./data/images/',
         output_folder='./results/',
-        mode='demo'
+        mode='demo',
+        onnx_model_path='rtdetr.onnx'
     )
     tracker.process_sequence()
 """
 
 import logging
+import os
 from pathlib import Path
-from typing import Dict, Set, Optional
+from typing import Optional
+from queue import Queue, Empty
+from threading import Thread
 
 import cv2
-import supervision as sv
 import pandas as pd
-from ultralytics import YOLO
-import os
+import supervision as sv
+
+from .detectors import OnnxRTDetrDetector
 
 from .visualization import draw_visualizations
-from .utils import calculate_angle, get_sorted_images, get_class_name, setup_detailed_logger
+from .utils import calculate_angle, get_sorted_images, get_class_name
 from .tracker_types import VehiclePassEvent, TrackerConfig
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 class VehiclePassTracker:
-    """Tracks and analyzes vehicles passing a bicycle using YOLOv5 and ByteTrack."""
+    """Tracks and analyzes vehicles passing a bicycle using RT-DETR and ByteTrack."""
     
     def __init__(
         self, 
@@ -43,7 +47,10 @@ class VehiclePassTracker:
         mode: str = 'demo',
         image_source_position: str = 'bottom_center',
         excluded_frames_path: Optional[str] = None,
-        config: Optional[TrackerConfig] = None
+        config: Optional[TrackerConfig] = None,
+        onnx_model_path: str = 'rtdetr.onnx',
+        display: bool = True,
+        output_format: str = 'png'
     ):
         """
         Initialize the vehicle pass tracker with paths and configuration
@@ -55,6 +62,9 @@ class VehiclePassTracker:
             image_source_position: Camera position reference
             excluded_frames_path: Optional CSV with frames to exclude
             config: Optional custom configuration
+            onnx_model_path: Path to RT-DETR ONNX model
+            display: Whether to show visualization window (False for headless)
+            output_format: Image format for saved frames ('png' or 'jpg')
         """
         self.config = config or TrackerConfig()
         
@@ -64,9 +74,19 @@ class VehiclePassTracker:
         self.buffer_frames = self.config.buffer_frames
         self.tolerance_threshold = self.config.tolerance_threshold
         self.confidence_threshold = self.config.confidence_threshold
-        self.min_angle_change = self.config.min_angle_change
+        self.cleanup_frames = self.config.cleanup_frames
 
         self._setup_paths(image_sequence_path, output_folder)
+        self.onnx_model_path = onnx_model_path
+        self.display = display
+        self.output_format = output_format.lower()
+        
+        # Initialize background frame saving
+        self.save_queue = Queue(maxsize=100)  # Buffer up to 100 frames
+        self.save_thread = Thread(target=self._frame_saver_worker, daemon=True)
+        self.save_thread_running = True
+        self.save_thread.start()
+        
         self._initialize_models()
         
         # Clear any existing handlers
@@ -95,9 +115,6 @@ class VehiclePassTracker:
         # Remove dual logging handlers
         logging.getLogger('__main__').handlers = []
         
-        # Setup detailed logging
-        self.log_buffer = setup_detailed_logger(output_folder)
-        
         # Algorithm settings
         self.mode = mode
         self.image_source_position = image_source_position
@@ -111,8 +128,8 @@ class VehiclePassTracker:
     def _initialize_models(self) -> None:
         """Initialize detection and tracking models."""
         try:
-            # Initialize YOLOv5 model
-            self.model = YOLO('yolov5lu.pt')  # Using YOLOv5 base model
+            # Initialize ONNX RT-DETR detector (Apache/MIT stack)
+            self.detector = OnnxRTDetrDetector(self.onnx_model_path, confidence_threshold=self.confidence_threshold)
             self.tracker = sv.ByteTrack()
         except Exception as e:
             logger.error(f"Failed to initialize models: {e}")
@@ -143,6 +160,35 @@ class VehiclePassTracker:
                 logger.error(f"Failed to load excluded frames: {e}")
                 self.excluded_ranges = None
 
+    def _frame_saver_worker(self):
+        """Background thread worker for saving frames to disk"""
+        while self.save_thread_running:
+            try:
+                # Get frame from queue (timeout to allow checking running flag)
+                item = self.save_queue.get(timeout=0.1)
+                if item is None:  # Poison pill to stop thread
+                    break
+                
+                output_path, frame = item
+                
+                # Save with appropriate format and quality
+                if self.output_format == 'png':
+                    # PNG: lossless, compression level 1 (fastest, still lossless)
+                    cv2.imwrite(output_path, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                else:
+                    # JPEG: quality 100 for best quality
+                    cv2.imwrite(output_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 100])
+                
+                self.save_queue.task_done()
+            except Empty:
+                # Queue empty, continue waiting
+                continue
+            except Exception as e:
+                # Log actual errors but don't crash the thread
+                logger.error(f"Error saving frame: {e}")
+                self.save_queue.task_done()
+                continue
+
     def _initialize_tracking_storage(self):
         """Initialize data structures for tracking"""
         self.passing_data = {
@@ -163,8 +209,9 @@ class VehiclePassTracker:
         self.active_tracks = {}
         self.completed_pass_ids = set()
         self.pass_count = 0
-        self.previous_angles = {}
         self.angle_history = {}
+        self.bbox_area_history = {}  # Track bounding box area for distance/depth filtering
+        self.probation_tracks = {}  # Tracks being evaluated before adding to potential_passing
         self.potential_passing = set()  # Tracks marked as potential passing
         self.confirmed_passing = set()  # Tracks that have passed 20 degrees
         self.current_angles = {}  # Current angles of active tracks
@@ -179,11 +226,11 @@ class VehiclePassTracker:
         
         # Calculate reference points based on camera position
         if self.image_source_position == 'bottom_center':
-            # Set confirmation point at 85% of the frame width
-            confirmation_x = frame_width * 0.85
+            # Set confirmation point using config parameter
+            confirmation_x = frame_width * self.config.confirmation_line_bottom_center
         else: # bottom_left
-            # Set confirmation point at 65% of the frame width
-            confirmation_x = frame_width * 0.65
+            # Set confirmation point using config parameter
+            confirmation_x = frame_width * self.config.confirmation_line_bottom_left
 
         # Get current position
         x1, y1, x2, y2 = detections.xyxy[detection_idx]
@@ -194,57 +241,136 @@ class VehiclePassTracker:
         current_angle = calculate_angle(center_x, center_y, frame_height, frame_width, self.image_source_position)
         self.current_angles[track_id] = current_angle
         
-        logger.info(f"Frame {current_frame} - Track {track_id}: current_angle={current_angle:.2f}, "
-                    f"center_x={center_x:.2f}, center_y={center_y:.2f}, right_x={x2:.2f}, confirmation_x={confirmation_x:.2f}")
-        
         # Check if it's a valid vehicle class
         if detections.class_id[detection_idx] not in self.valid_classes:
             return False
         
-        # Check if vehicle is in right half of the frame (left to the bicycle)
-        if not (0 <= current_angle <= 90):
+        # Check if vehicle is in valid angle range (configured, default: right half of frame 0-90°)
+        if not (self.config.min_angle <= current_angle <= self.config.max_angle):
             return False
             
-        # Initialize angle tracking for new vehicles
-        if track_id not in self.previous_angles:
-            self.previous_angles[track_id] = current_angle
+        # Initialize angle and bbox size tracking for new vehicles
+        if track_id not in self.angle_history:
+            bbox_area = (x2 - x1) * (y2 - y1)
             self.angle_history[track_id] = [current_angle]
+            self.bbox_area_history[track_id] = [bbox_area]
             return False
         
-        # Update and maintain angle history
+        # Update and maintain history (configurable window size for robust trend detection)
+        bbox_area = (x2 - x1) * (y2 - y1)
+        
         self.angle_history[track_id].append(current_angle)
-        if len(self.angle_history[track_id]) > 5:
+        if len(self.angle_history[track_id]) > self.config.history_window_size:
             self.angle_history[track_id].pop(0)
+        
+        self.bbox_area_history[track_id].append(bbox_area)
+        if len(self.bbox_area_history[track_id]) > self.config.history_window_size:
+            self.bbox_area_history[track_id].pop(0)
+        
+        # Compute angle trend
+        angle_trend = self._compute_angle_trend(track_id)
+        
+        bbox_area_current = (x2 - x1) * (y2 - y1)
+        prev_area = self.bbox_area_history[track_id][-2] if len(self.bbox_area_history[track_id]) >= 2 else bbox_area_current
+        area_growth = bbox_area_current - prev_area
+        logger.info(f"Frame {current_frame} - Track {track_id}: angle={current_angle:.2f}, "
+                    f"area={bbox_area_current:.0f}, darea={area_growth:.0f}, trend={angle_trend}")
+        
+        # Filter out oncoming traffic based on angle trend
+        # Overtaking: angle increases (left→right), Oncoming: angle decreases (right→left)
+        if angle_trend == 'decreasing':
+            # Angle decreasing indicates oncoming traffic or tracking error
+            if track_id in self.potential_passing:
+                logger.info(f"Track {track_id}: Removing from potential_passing - angle trend reversed to decreasing")
+                self.potential_passing.discard(track_id)
+                if track_id in self.potential_passing_tracks:
+                    del self.potential_passing_tracks[track_id]
+            
+            # Stop tracking if confirmed vehicle reverses direction
+            if track_id in self.confirmed_passing:
+                logger.info(f"Track {track_id}: Removing from confirmed_passing - angle trend reversed (wrong direction or ByteTrack ID reuse)")
+                self.confirmed_passing.discard(track_id)
+                if track_id in self.confirmed_passing_frames:
+                    del self.confirmed_passing_frames[track_id]
+            
+            return False
         
         if track_id not in self.potential_passing:
             logger.debug(f"Track {track_id}: angle history len={len(self.angle_history[track_id])}, "
                          f"angles={self.angle_history[track_id]}")
         
         # Check if angle is consistently increasing (moving left to right)
-        if len(self.angle_history[track_id]) >= 3:
+        if len(self.angle_history[track_id]) >= self.config.min_frames_for_evaluation:
             angles = self.angle_history[track_id]
-            is_increasing = all(angles[i] < angles[i+1] for i in range(len(angles)-1))
-            significant_change = (angles[-1] - angles[0]) >= self.min_angle_change
+            n = len(angles)
+
+            # Calculate angle slope (degrees/frame) via linear regression
+            x_vals = list(range(n))
+            mean_x = sum(x_vals) / n
+            mean_y = sum(angles) / n
+            num = sum((x_vals[i] - mean_x) * (angles[i] - mean_y) for i in range(n))
+            den = sum((x_vals[i] - mean_x) ** 2 for i in range(n))
+            slope = (num / den) if den != 0 else 0.0
+
+            # Count angle increases
+            increase_count = sum(1 for i in range(n-1) if angles[i+1] > angles[i])
+
+            # Check bounding box growth (approaching vehicles grow in size)
+            bbox_areas = self.bbox_area_history[track_id]
             
-            if is_increasing and significant_change:
-                # Track new potential passing event
-                if track_id not in self.potential_passing:
-                    self.potential_passing.add(track_id)
-                    self.pass_count += 1
-                    self.potential_passing_tracks[track_id] = {
-                        'first_frame': current_frame,
-                        'last_seen': current_frame,
-                        'vehicle_class': detections.class_id[detection_idx],
-                        'passing_id': self.pass_count
+            # Calculate bbox growth rate over history window
+            bbox_growth_rate = (bbox_areas[-1] - bbox_areas[0]) / max(1, len(bbox_areas) - 1) if len(bbox_areas) >= 2 else 0
+            
+            # Both conditions must be satisfied for valid overtaking detection
+            if (
+                slope >= self.config.min_angle_slope and
+                increase_count >= self.config.min_angle_increase_count and
+                bbox_growth_rate >= self.config.min_bbox_growth_rate
+            ):
+                # Enter probation period
+                if track_id not in self.probation_tracks and track_id not in self.potential_passing:
+                    self.probation_tracks[track_id] = {
+                        'start_frame': current_frame,
+                        'frames_passed': 0
                     }
-                else:
-                    self.potential_passing_tracks[track_id]['last_seen'] = current_frame
+                    logger.info(f"Track {track_id}: Entered probation at frame {current_frame}")
                 
-                # Confirm passing based on right edge of bounding box position
-                if x2 >= confirmation_x and track_id not in self.confirmed_passing:
-                    self.confirmed_passing.add(track_id)
-                    self.confirmed_passing_frames[track_id] = current_frame
+                # If in probation, increment counter
+                if track_id in self.probation_tracks:
+                    self.probation_tracks[track_id]['frames_passed'] += 1
+                    
+                    # Graduate from probation after consecutive frames pass all checks
+                    if self.probation_tracks[track_id]['frames_passed'] >= self.config.probation_frames:
+                        if track_id not in self.potential_passing:
+                            logger.info(f"Track {track_id}: Graduated from probation to potential_passing at frame {current_frame}")
+                            self.potential_passing.add(track_id)
+                            self.pass_count += 1
+                            self.potential_passing_tracks[track_id] = {
+                                'first_frame': current_frame,
+                                'last_seen': current_frame,
+                                'vehicle_class': detections.class_id[detection_idx],
+                                'passing_id': self.pass_count,
+                                'was_confirmed': False
+                            }
+                            del self.probation_tracks[track_id]
+                
+                # Update last_seen for already-passing tracks
+                if track_id in self.potential_passing:
+                    self.potential_passing_tracks[track_id]['last_seen'] = current_frame
+                    
+                    # Confirm passing when vehicle reaches confirmation line
+                    if x2 >= confirmation_x and track_id not in self.confirmed_passing:
+                        self.confirmed_passing.add(track_id)
+                        self.confirmed_passing_frames[track_id] = current_frame
+                        self.potential_passing_tracks[track_id]['was_confirmed'] = True
+                        self.potential_passing_tracks[track_id]['passing_frame'] = current_frame
+                
                 return True
+            else:
+                # Remove from probation if checks fail
+                if track_id in self.probation_tracks:
+                    logger.info(f"Track {track_id}: Removed from probation - failed checks")
+                    del self.probation_tracks[track_id]
                 
         return False
 
@@ -255,33 +381,46 @@ class VehiclePassTracker:
         sorted_image_sequence = get_sorted_images(self.image_sequence_path)
 
         self.image_sequence_length = len(sorted_image_sequence)
+        
+        # Log processing start
+        logger.info(f"="*60)
+        logger.info(f"Starting processing of {self.image_sequence_length} frames")
+        logger.info(f"Output folder: {self.output_folder}")
+        logger.info(f"Mode: {self.mode}")
+        logger.info(f"Camera position: {self.image_source_position}")
+        logger.info(f"Display: {'Enabled' if self.display else 'Disabled (headless)'}")
+        logger.info(f"Output format: {self.output_format.upper()}")
+        logger.info(f"="*60)
 
         # Initialize frame counter
         current_frame = 0
+        last_logged_frame = -1  # Track last frame that was logged
         
         try:
             for image in sorted_image_sequence:
                 
-                # Read frame
+                # Read frame with highest quality settings
                 frame_path = os.path.join(self.image_sequence_path, image)
-                frame = cv2.imread(frame_path)
+                frame = cv2.imread(frame_path, cv2.IMREAD_COLOR)
                 if frame is None:
+                    logger.warning(f"Failed to read frame: {frame_path}")
                     break
                 
                 # Get frame dimensions
                 frame_height, frame_width = frame.shape[:2]
 
-                # Run YOLOv5 inference
-                results = self.model(frame, conf=self.confidence_threshold)[0]
-
-                # Convert detections to supervision format
-                detections = sv.Detections.from_ultralytics(results)
+                # Run RT-DETR ONNX inference -> supervision Detections
+                detections = self.detector.infer(frame)
                 
                 # Update tracks with ByteTrack results
                 detections = self.tracker.update_with_detections(detections)
                 
-                # Log detection details
-                self._log_frame_details(current_frame, results, detections)
+                # Log detection details (with gap summary if frames were skipped due to no detections)
+                self._log_frame_details(current_frame, detections, last_logged_frame)
+                
+                # Update last logged frame if this frame had content
+                if len(detections) > 0 or self.potential_passing or self.confirmed_passing:
+                    last_logged_frame = current_frame
 
                 # Process each track
                 self.process_tracks(detections, frame_width, current_frame)
@@ -297,57 +436,80 @@ class VehiclePassTracker:
                     self.potential_passing_tracks
                 )
                 
-                # Save output frame
-                output_path = os.path.join(self.output_image_folder, f'output_{current_frame}.jpg')
-                cv2.imwrite(output_path, annotated_frame)
+                # Save output frame in background thread (non-blocking)
+                file_ext = 'png' if self.output_format == 'png' else 'jpg'
+                output_path = os.path.join(self.output_image_folder, f'output_{current_frame}.{file_ext}')
+                # Add to queue for background saving
+                self.save_queue.put((output_path, annotated_frame))
                 
-                cv2.imshow("Vehicle Pass Tracker", frame)
+                # Display window (optional)
+                if self.display:
+                    cv2.imshow("Vehicle Pass Tracker", annotated_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
                 
                 # Display progress in log
                 if current_frame % 100 == 0:
-                    print(f"Processing frame: {current_frame}")
+                    print(f"Processing frame: {current_frame}", flush=True)
                 
-                # Force log flush every 10 frames
+                # Periodic log flush to ensure logs are written
                 if current_frame % 10 == 0:
                     for handler in logging.getLogger().handlers:
                         handler.flush()
                 
+                # Periodic CSV save to prevent data loss (every 1000 frames)
+                if current_frame > 0 and current_frame % 1000 == 0:
+                    if self.passing_data['track_id']:  # Only if we have data
+                        logger.info(f"Saving intermediate results at frame {current_frame}...")
+                        self.save_to_csv()
+                
                 current_frame += 1
         finally:
+            # Wait for all frames to be saved
+            print("Waiting for all frames to be saved...")
+            self.save_queue.join()  # Wait for queue to be empty
+            
+            # Stop the background thread
+            self.save_thread_running = False
+            self.save_queue.put(None)  # Poison pill
+            self.save_thread.join(timeout=5)  # Wait up to 5 seconds
+            
             # Ensure all logs are written
             for handler in logging.getLogger().handlers:
                 handler.flush()
-                
-            # Flush the log buffer
-            if hasattr(self, 'log_buffer'):
-                self.log_buffer.flush(force=True)
 
         # Final cleanup
-        cv2.destroyAllWindows()
+        if self.display:
+            cv2.destroyAllWindows()
 
         # Save tracking data to CSV
         self.save_to_csv()
 
-    def _log_frame_details(self, frame_number, yolo_results, detections):
+    def _log_frame_details(self, frame_number, detections, last_logged_frame):
         """Log detailed information about the current frame"""
         if len(detections) > 0 or self.potential_passing or self.confirmed_passing:
             log_entry = []
+            
+            # If there's a gap since last logged frame, add summary
+            if last_logged_frame >= 0 and frame_number > last_logged_frame + 1:
+                gap_start = last_logged_frame + 1
+                gap_end = frame_number - 1
+                if gap_start == gap_end:
+                    log_entry.append(f"\n[Frame {gap_start}: No detections]")
+                else:
+                    log_entry.append(f"\n[Frames {gap_start}-{gap_end}: No detections]")
+            
             log_entry.append(f"\nFrame {frame_number}:")
             
             # Log YOLO detections
             if len(detections) > 0:
                 log_entry.append("  Detections:")
-                valid_indices = range(min(len(detections.class_id), 
-                                       len(yolo_results.boxes.conf)))
-                
-                for i in valid_indices:
+                for i in range(len(detections)):
                     class_id = detections.class_id[i]
                     if class_id in self.valid_classes:
                         track_id = detections.tracker_id[i]
                         class_name = get_class_name(class_id)
-                        conf = yolo_results.boxes.conf[i]
+                        conf = float(detections.confidence[i]) if detections.confidence is not None else 1.0
                         log_entry.append(f"    - {class_name} "
                                     f"(Detection #{i}, ByteTrack ID: {track_id}, "
                                     f"Confidence: {conf:.2f})")
@@ -408,10 +570,6 @@ class VehiclePassTracker:
                     logger.info(f"  bbox_coordinates: ({x1:.2f}, {y1:.2f}, {x2:.2f}, {y2:.2f})")
                     logger.info(f"  ref_point_distance: {ref_point_distance:.2f}")
                     logger.info(f"  passing_angle: {passing_angle:.2f}")
-            
-                # Update last_seen frame whenever the track is active
-                if track_id in self.potential_passing_tracks:
-                    self.potential_passing_tracks[track_id]['last_seen'] = current_frame
         
         # Cleanup inactive tracks in one pass
         self._cleanup_tracks(active_ids_this_frame, current_frame)
@@ -421,11 +579,12 @@ class VehiclePassTracker:
         tracks_to_remove = []
         for track_id in list(self.potential_passing_tracks.keys()):
             track_data = self.potential_passing_tracks[track_id]
-            # Remove tracks that have been inactive for 30 frames
+            # Remove tracks that have been inactive for cleanup_frames
             if track_id not in active_ids_this_frame:
-                if current_frame - track_data['last_seen'] > 30:
-                    if track_id in self.confirmed_passing:
-                        # Pass the last_seen frame directly from track_data
+                if current_frame - track_data['last_seen'] > self.cleanup_frames:
+                    # Use was_confirmed flag instead of checking confirmed_passing set
+                    # This ensures we record events even if removed from confirmed_passing
+                    if track_data.get('was_confirmed', False):
                         self._record_passing_event(track_id, True)
                     tracks_to_remove.append(track_id)
         
@@ -447,8 +606,8 @@ class VehiclePassTracker:
         if last_frame - first_frame <= self.min_passing_frames_threshold:
             return
             
-        # Get the passing frame from confirmed_passing_frames
-        passing_frame = self.confirmed_passing_frames.get(track_id, -1)
+        # Get the passing frame from track data (stored when first confirmed)
+        passing_frame = track_data.get('passing_frame', -1)
             
         # Create event with stored measurements
         event = VehiclePassEvent(
@@ -486,10 +645,12 @@ class VehiclePassTracker:
         """Remove a track and its associated data"""
         if track_id in self.potential_passing_tracks:
             del self.potential_passing_tracks[track_id]
-        if track_id in self.previous_angles:
-            del self.previous_angles[track_id]
         if track_id in self.angle_history:
             del self.angle_history[track_id]
+        if track_id in self.bbox_area_history:
+            del self.bbox_area_history[track_id]
+        if track_id in self.probation_tracks:
+            del self.probation_tracks[track_id]
         if track_id in self.potential_passing:
             self.potential_passing.remove(track_id)
         if track_id in self.confirmed_passing:
@@ -505,7 +666,56 @@ class VehiclePassTracker:
                 end_frame <= exclusion['end_frame']):
                 return True
         return False
-
+    
+    def _compute_angle_trend(self, track_id: int) -> str:
+        """
+        Compute angle trend based on angle history (camera-position invariant).
+        
+        Uses linear regression to handle detection noise better.
+        
+        Returns:
+            'increasing': Angle increasing over time (overtaking: left->right)
+            'decreasing': Angle decreasing over time (oncoming: right->left)
+            'stable': No significant trend
+        """
+        if track_id not in self.angle_history:
+            return 'stable'
+        
+        angles = self.angle_history[track_id]
+        
+        # Need at least 3 angles to determine trend
+        if len(angles) < 3:
+            return 'stable'
+        
+        # Simple linear regression: compute average slope
+        # Using indices as x-values (time progression)
+        n = len(angles)
+        x_values = list(range(n))
+        
+        # Calculate means
+        mean_x = sum(x_values) / n
+        mean_y = sum(angles) / n
+        
+        # Calculate slope: m = Σ((x-mean_x)(y-mean_y)) / Σ((x-mean_x)²)
+        numerator = sum((x_values[i] - mean_x) * (angles[i] - mean_y) for i in range(n))
+        denominator = sum((x_values[i] - mean_x) ** 2 for i in range(n))
+        
+        if denominator == 0:
+            return 'stable'
+        
+        slope = numerator / denominator
+        
+        # Threshold for significant trend (degrees per frame)
+        # Uses config parameter for detecting increasing/decreasing trends
+        trend_threshold = self.config.angle_trend_threshold
+        
+        if slope > trend_threshold:
+            return 'increasing'  # Overtaking direction
+        elif slope < -trend_threshold:
+            return 'decreasing'  # Oncoming direction
+        else:
+            return 'stable'  # No clear trend
+    
     def post_process_detections(self):
         """Post-process detected events to remove invalid detections"""
         if not self.passing_data['track_id']:  # If no detections, return early
@@ -574,7 +784,7 @@ class VehiclePassTracker:
 
     def save_to_csv(self):
         """Post-process and save tracking results to CSV"""
-        # Apply post-processing
+        # Apply post-processing (merging, filtering, etc.)
         self.post_process_detections()
 
         # Convert to DataFrame and sort by last_frame
@@ -583,5 +793,5 @@ class VehiclePassTracker:
         
         csv_path = os.path.join(self.output_folder, 'vehicle_passing.csv')
         df.to_csv(csv_path, index=False)
-        print(f"Results saved to: {csv_path}")
+        logger.info(f"Results saved to: {csv_path} ({len(df)} events)")
         print(f"Total confirmed vehicle passing events: {len(df)}")
