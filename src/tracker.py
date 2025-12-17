@@ -27,6 +27,7 @@ from threading import Thread
 import cv2
 import pandas as pd
 import supervision as sv
+import numpy as np
 
 from .detectors import OnnxRTDetrDetector
 
@@ -70,7 +71,7 @@ class VehiclePassTracker:
         
         # Initialize configuration attributes
         self.valid_classes = self.config.valid_vehicle_classes
-        self.min_passing_frames_threshold = self.config.min_passing_frames_threshold
+        self.min_event_duration_frames = self.config.min_event_duration_frames
         self.buffer_frames = self.config.buffer_frames
         self.tolerance_threshold = self.config.tolerance_threshold
         self.confidence_threshold = self.config.confidence_threshold
@@ -128,9 +129,20 @@ class VehiclePassTracker:
     def _initialize_models(self) -> None:
         """Initialize detection and tracking models."""
         try:
-            # Initialize ONNX RT-DETR detector (Apache/MIT stack)
-            self.detector = OnnxRTDetrDetector(self.onnx_model_path, confidence_threshold=self.confidence_threshold)
-            self.tracker = sv.ByteTrack()
+            # Initialize ONNX RT-DETR detector
+            self.detector = OnnxRTDetrDetector(
+                self.onnx_model_path, 
+                confidence_threshold=self.confidence_threshold
+            )
+
+            # Initialize ByteTrack with tuned parameters for RT-DETR
+            # Note: supervision uses different parameter names than raw ByteTrack
+            self.tracker = sv.ByteTrack(
+                track_activation_threshold=0.55,      # Stricter: only create tracks for high-conf detections (was 0.25)
+                lost_track_buffer=10,                 # Reduced further to limit ID reuse window (was 15)
+                minimum_matching_threshold=0.70,      # Stricter: reduce cross-vehicle ID switches (was 0.8)
+                frame_rate=10                         # Match actual frame rate
+            )
         except Exception as e:
             logger.error(f"Failed to initialize models: {e}")
             raise
@@ -206,6 +218,7 @@ class VehiclePassTracker:
             'bbox_y2': []
         }
 
+        # Initialize tracking state variables
         self.active_tracks = {}
         self.completed_pass_ids = set()
         self.pass_count = 0
@@ -217,6 +230,120 @@ class VehiclePassTracker:
         self.current_angles = {}  # Current angles of active tracks
         self.potential_passing_tracks = {}  # Track data for potential passings
         self.confirmed_passing_frames = {}  # Store first frame of confirmed passing
+
+    def suppress_duplicate_detections(self, detections: sv.Detections, iou_threshold: float = 0.90) -> sv.Detections:
+        """Suppress near-identical duplicate boxes before ByteTrack (class-agnostic).
+
+        This is intentionally conservative (high IoU) to avoid changing behavior
+        beyond removing clear same-object duplicates (often caused by class flips).
+        """
+        if len(detections) <= 1:
+            return detections
+
+        boxes = detections.xyxy
+        if boxes is None or len(boxes) <= 1:
+            return detections
+
+        scores = detections.confidence
+        if scores is None or len(scores) != len(boxes):
+            scores = np.ones((len(boxes),), dtype=np.float32)
+
+        order = np.argsort(scores)[::-1]
+        keep: list[int] = []
+
+        while order.size > 0:
+            i = int(order[0])
+            keep.append(i)
+            if order.size == 1:
+                break
+
+            rest = order[1:]
+            xx1 = np.maximum(boxes[i, 0], boxes[rest, 0])
+            yy1 = np.maximum(boxes[i, 1], boxes[rest, 1])
+            xx2 = np.minimum(boxes[i, 2], boxes[rest, 2])
+            yy2 = np.minimum(boxes[i, 3], boxes[rest, 3])
+
+            inter_w = np.maximum(0.0, xx2 - xx1)
+            inter_h = np.maximum(0.0, yy2 - yy1)
+            inter = inter_w * inter_h
+
+            area_i = (boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1])
+            area_rest = (boxes[rest, 2] - boxes[rest, 0]) * (boxes[rest, 3] - boxes[rest, 1])
+            union = np.maximum(area_i + area_rest - inter, 1e-6)
+            iou = inter / union
+
+            order = rest[iou < iou_threshold]
+
+        if len(keep) == len(detections):
+            return detections
+
+        keep_mask = np.zeros((len(detections),), dtype=bool)
+        keep_mask[np.array(keep, dtype=np.int64)] = True
+        return detections[keep_mask]
+    
+    def detect_same_frame_duplicates(self, confirmed_tracks_this_frame: dict) -> set:
+        """
+        Detect duplicate confirmations in the same frame.
+        Returns set of track IDs that should be removed as duplicates.
+        
+        Args:
+            confirmed_tracks_this_frame: Dict mapping track_id -> track info for current frame
+            
+        Returns:
+            Set of track IDs to remove as duplicates
+        """
+        if len(confirmed_tracks_this_frame) <= 1:
+            return set()
+        
+        import numpy as np
+        duplicates = set()
+        track_list = list(confirmed_tracks_this_frame.items())
+        
+        for i, (track_id1, info1) in enumerate(track_list):
+            if track_id1 in duplicates:
+                continue
+                
+            for track_id2, info2 in track_list[i+1:]:
+                if track_id2 in duplicates:
+                    continue
+                
+                angle_diff = abs(info1['angle'] - info2['angle'])
+                distance_diff = abs(info1['distance'] - info2['distance'])
+                
+                # Calculate IoU
+                bbox1 = info1['bbox']
+                bbox2 = info2['bbox']
+                x1_max = max(bbox1[0], bbox2[0])
+                y1_max = max(bbox1[1], bbox2[1])
+                x2_min = min(bbox1[2], bbox2[2])
+                y2_min = min(bbox1[3], bbox2[3])
+                
+                intersection = max(0, x2_min - x1_max) * max(0, y2_min - y1_max)
+                area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
+                area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
+                union = area1 + area2 - intersection
+                iou = intersection / union if union > 0 else 0
+                
+                # Very strict criteria for same frame duplicates
+                if (angle_diff < 0.5 and       # < 0.5° difference
+                    distance_diff < 50 and     # < 50cm difference
+                    iou > 0.5):                # Significant overlap
+                    
+                    # Keep higher confidence track, mark lower as duplicate
+                    conf1 = info1.get('confidence', 0)
+                    conf2 = info2.get('confidence', 0)
+                    
+                    if conf1 >= conf2:
+                        duplicates.add(track_id2)
+                        logger.info(f"Same-frame duplicate detected: Track {track_id2} is duplicate of {track_id1} "
+                                  f"(angle_diff={angle_diff:.2f}°, dist_diff={distance_diff:.1f}cm, IoU={iou:.3f})")
+                    else:
+                        duplicates.add(track_id1)
+                        logger.info(f"Same-frame duplicate detected: Track {track_id1} is duplicate of {track_id2} "
+                                  f"(angle_diff={angle_diff:.2f}°, dist_diff={distance_diff:.1f}cm, IoU={iou:.3f})")
+                        break  # track_id1 is marked, no need to continue inner loop
+        
+        return duplicates
 
     def is_valid_passing(self, track_id, detection_idx, detections, frame_width, frame_height, current_frame):
         """Validate if detection represents a passing event"""
@@ -279,20 +406,25 @@ class VehiclePassTracker:
         # Filter out oncoming traffic based on angle trend
         # Overtaking: angle increases (left→right), Oncoming: angle decreases (right→left)
         if angle_trend == 'decreasing':
-            # Angle decreasing indicates oncoming traffic or tracking error
-            if track_id in self.potential_passing:
-                logger.info(f"Track {track_id}: Removing from potential_passing - angle trend reversed to decreasing")
-                self.potential_passing.discard(track_id)
-                if track_id in self.potential_passing_tracks:
-                    del self.potential_passing_tracks[track_id]
-            
-            # Stop tracking if confirmed vehicle reverses direction
-            if track_id in self.confirmed_passing:
-                logger.info(f"Track {track_id}: Removing from confirmed_passing - angle trend reversed (wrong direction or ByteTrack ID reuse)")
-                self.confirmed_passing.discard(track_id)
-                if track_id in self.confirmed_passing_frames:
-                    del self.confirmed_passing_frames[track_id]
-            
+            # Angle decreasing indicates oncoming traffic, or ByteTrack ID reuse.
+            # If this track was already confirmed, we treat the reversal as an identity-switch
+            # boundary: finalize the confirmed event ending at the previous frame, record it,
+            # then reset/remove per-track state so the new vehicle can be evaluated cleanly.
+            track_data = self.potential_passing_tracks.get(track_id)
+            if track_data is not None and track_data.get('was_confirmed', False):
+                end_frame = max(int(track_data.get('first_frame', 0)), int(current_frame) - 1)
+                track_data['last_seen'] = end_frame
+                logger.info(
+                    f"Track {track_id}: Confirmed event ends at frame {end_frame} "
+                    f"(angle trend reversed at frame {current_frame}); recording and resetting track state"
+                )
+                self._record_passing_event(track_id, True)
+                self._remove_track(track_id)
+                return False
+
+            # Not confirmed yet: drop the candidate as oncoming/invalid.
+            logger.info(f"Track {track_id}: Removing from potential/confirmed - angle trend reversed to decreasing")
+            self._remove_track(track_id)
             return False
         
         if track_id not in self.potential_passing:
@@ -314,6 +446,11 @@ class VehiclePassTracker:
 
             # Count angle increases
             increase_count = sum(1 for i in range(n-1) if angles[i+1] > angles[i])
+            
+            # Calculate required increase count relative to history window size
+            # With n frames, max possible increases is n-1
+            # Require at least min_angle_increase_count, but cap at n-1 (max possible)
+            required_increase_count = min(self.config.min_angle_increase_count, n - 1)
 
             # Check bounding box growth (approaching vehicles grow in size)
             bbox_areas = self.bbox_area_history[track_id]
@@ -321,10 +458,18 @@ class VehiclePassTracker:
             # Calculate bbox growth rate over history window
             bbox_growth_rate = (bbox_areas[-1] - bbox_areas[0]) / max(1, len(bbox_areas) - 1) if len(bbox_areas) >= 2 else 0
             
+            # Debug logging for validation checks
+            if track_id not in self.probation_tracks and track_id not in self.potential_passing:
+                logger.debug(f"Frame {current_frame} - Track {track_id}: Validation checks - "
+                           f"slope={slope:.3f} (need {self.config.min_angle_slope:.1f}), "
+                           f"increase_count={increase_count}/{n-1} (need {required_increase_count}), "
+                           f"bbox_growth_rate={bbox_growth_rate:.1f} (need {self.config.min_bbox_growth_rate:.1f}), "
+                           f"history_len={n}")
+            
             # Both conditions must be satisfied for valid overtaking detection
             if (
                 slope >= self.config.min_angle_slope and
-                increase_count >= self.config.min_angle_increase_count and
+                increase_count >= required_increase_count and
                 bbox_growth_rate >= self.config.min_bbox_growth_rate
             ):
                 # Enter probation period
@@ -357,9 +502,27 @@ class VehiclePassTracker:
                 # Update last_seen for already-passing tracks
                 if track_id in self.potential_passing:
                     self.potential_passing_tracks[track_id]['last_seen'] = current_frame
-                    
+                
                     # Confirm passing when vehicle reaches confirmation line
                     if x2 >= confirmation_x and track_id not in self.confirmed_passing:
+                        # Collect confirmation info for duplicate suppression in this frame
+                        center_x = (x1 + x2) / 2
+                        center_y = (y1 + y2) / 2
+                        if self.image_source_position == 'bottom_center':
+                            ref_x = frame_width / 2
+                            ref_y = frame_height - 5
+                        else:
+                            ref_x = 0
+                            ref_y = frame_height - 5
+                        ref_point_distance = ((center_x - ref_x) ** 2 + (center_y - ref_y) ** 2) ** 0.5
+                        confidence = detections.confidence[detection_idx] if detection_idx < len(detections.confidence) else 0
+                        self.confirmed_this_frame[track_id] = {
+                            'angle': self.current_angles.get(track_id, 0),
+                            'distance': ref_point_distance,
+                            'bbox': (x1, y1, x2, y2),
+                            'confidence': confidence
+                        }
+
                         self.confirmed_passing.add(track_id)
                         self.confirmed_passing_frames[track_id] = current_frame
                         self.potential_passing_tracks[track_id]['was_confirmed'] = True
@@ -411,19 +574,44 @@ class VehiclePassTracker:
 
                 # Run RT-DETR ONNX inference -> supervision Detections
                 detections = self.detector.infer(frame)
-                
+
+                # suppress near-identical duplicate boxes (class-agnostic)
+                # Helps prevent same-frame double IDs caused by duplicate detections/class flips.
+                detections = self.suppress_duplicate_detections(detections, iou_threshold=0.90)
+
                 # Update tracks with ByteTrack results
                 detections = self.tracker.update_with_detections(detections)
-                
+
                 # Log detection details (with gap summary if frames were skipped due to no detections)
                 self._log_frame_details(current_frame, detections, last_logged_frame)
-                
+
                 # Update last logged frame if this frame had content
                 if len(detections) > 0 or self.potential_passing or self.confirmed_passing:
                     last_logged_frame = current_frame
 
+                # Reset per-frame confirmation cache (used for same-frame duplicate suppression)
+                self.confirmed_this_frame = {}
+
                 # Process each track
                 self.process_tracks(detections, frame_width, current_frame)
+                
+                # Detect and remove same-frame duplicates (ID switches / class flips on same object)
+                if self.confirmed_this_frame:
+                    duplicates = self.detect_same_frame_duplicates(self.confirmed_this_frame)
+                    for dup_track_id in duplicates:
+                        # Remove from confirmed sets
+                        if dup_track_id in self.confirmed_passing:
+                            self.confirmed_passing.discard(dup_track_id)
+                        if dup_track_id in self.confirmed_passing_frames:
+                            del self.confirmed_passing_frames[dup_track_id]
+                        # Also drop from potential state to avoid later confirmations
+                        if dup_track_id in self.potential_passing:
+                            self.potential_passing.discard(dup_track_id)
+                        if dup_track_id in self.potential_passing_tracks:
+                            del self.potential_passing_tracks[dup_track_id]
+                        logger.info(f"Removed duplicate track {dup_track_id} (same-frame overlap)")
+                    # Clear for next frame
+                    self.confirmed_this_frame = {}
 
                 # Draw visualizations
                 annotated_frame = draw_visualizations(
@@ -445,8 +633,8 @@ class VehiclePassTracker:
                 # Display window (optional)
                 if self.display:
                     cv2.imshow("Vehicle Pass Tracker", annotated_frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        return
                 
                 # Display progress in log
                 if current_frame % 100 == 0:
@@ -458,10 +646,11 @@ class VehiclePassTracker:
                         handler.flush()
                 
                 # Periodic CSV save to prevent data loss (every 1000 frames)
+                # Use post_process=False to avoid destructive merging during active tracking
                 if current_frame > 0 and current_frame % 1000 == 0:
                     if self.passing_data['track_id']:  # Only if we have data
                         logger.info(f"Saving intermediate results at frame {current_frame}...")
-                        self.save_to_csv()
+                        self.save_to_csv(post_process=False)
                 
                 current_frame += 1
         finally:
@@ -603,15 +792,22 @@ class VehiclePassTracker:
         first_frame = track_data['first_frame']
         last_frame = track_data['last_seen']
         
-        if last_frame - first_frame <= self.min_passing_frames_threshold:
+        # Filter out events that are too short (likely noise or false positives)
+        if last_frame - first_frame <= self.min_event_duration_frames:
             return
             
         # Get the passing frame from track data (stored when first confirmed)
         passing_frame = track_data.get('passing_frame', -1)
+        pass_id = track_data['passing_id']
+        
+        # Prevent duplicate recording of the same pass_id
+        if pass_id in self.completed_pass_ids:
+            logger.warning(f"Pass ID {pass_id} (track {track_id}) already recorded, skipping duplicate")
+            return
             
         # Create event with stored measurements
         event = VehiclePassEvent(
-            pass_id=track_data['passing_id'],
+            pass_id=pass_id,
             track_id=track_id,
             first_frame=first_frame,
             last_frame=last_frame,
@@ -639,18 +835,25 @@ class VehiclePassTracker:
         self.passing_data['bbox_x2'].append(event.bbox_x2)
         self.passing_data['bbox_y2'].append(event.bbox_y2)
             
-        logger.info(f"Recorded confirmed passing event for track {track_id}")
+        # Mark this pass_id as completed
+        self.completed_pass_ids.add(pass_id)
+            
+        logger.info(f"Recorded confirmed passing event for track {track_id} with pass_id {pass_id}")
 
     def _remove_track(self, track_id):
         """Remove a track and its associated data"""
         if track_id in self.potential_passing_tracks:
             del self.potential_passing_tracks[track_id]
+        if track_id in self.confirmed_passing_frames:
+            del self.confirmed_passing_frames[track_id]
         if track_id in self.angle_history:
             del self.angle_history[track_id]
         if track_id in self.bbox_area_history:
             del self.bbox_area_history[track_id]
         if track_id in self.probation_tracks:
             del self.probation_tracks[track_id]
+        if track_id in self.current_angles:
+            del self.current_angles[track_id]
         if track_id in self.potential_passing:
             self.potential_passing.remove(track_id)
         if track_id in self.confirmed_passing:
@@ -715,11 +918,22 @@ class VehiclePassTracker:
             return 'decreasing'  # Oncoming direction
         else:
             return 'stable'  # No clear trend
+
     
-    def post_process_detections(self):
-        """Post-process detected events to remove invalid detections"""
+    def post_process_detections(self, merge_events=True):
+        """Post-process detected events to remove invalid detections
+        
+        Args:
+            merge_events: If True, merge overlapping events. Set to False for periodic saves
+                         to avoid data loss during active tracking.
+        """
         if not self.passing_data['track_id']:  # If no detections, return early
             return
+
+        # Preserve all original pass_id values before any processing
+        # This prevents duplicate recording if merged events lose some pass_id values
+        original_pass_ids = set(self.passing_data['pass_id'])
+        self.completed_pass_ids.update(original_pass_ids)
 
         # Convert to DataFrame for easier processing
         df = pd.DataFrame(self.passing_data)
@@ -732,37 +946,45 @@ class VehiclePassTracker:
                     valid_detections.append(idx)
             df = df.loc[valid_detections]
 
-        # Merge overlapping events only if they belong to the same track_id
-        sorted_df = df.sort_values(['track_id', 'first_frame'])
-        merged_detections = []
-        
-        # Group by track_id to handle each vehicle separately
-        for _, group in sorted_df.groupby('track_id'):
-            i = 0
-            group_rows = group.to_dict('records')
+        # Merge overlapping events only if merge_events=True (skip during periodic saves)
+        if merge_events:
+            sorted_df = df.sort_values(['track_id', 'first_frame'])
+            merged_detections = []
             
-            while i < len(group_rows):
-                current = group_rows[i].copy()
-                j = i + 1
+            # Group by track_id to handle each vehicle separately
+            for _, group in sorted_df.groupby('track_id'):
+                i = 0
+                group_rows = group.to_dict('records')
                 
-                while j < len(group_rows):
-                    next_det = group_rows[j]
-                    # Only merge if it's the same track_id and frames are within tolerance
-                    if (next_det['track_id'] == current['track_id'] and 
-                        next_det['first_frame'] <= current['last_frame'] + self.tolerance_threshold):
-                        current['last_frame'] = max(current['last_frame'], next_det['last_frame'])
-                        j += 1
-                    else:
-                        break
-                        
-                # Add buffer frames
-                current['first_frame'] = max(0, current['first_frame'] - self.buffer_frames)
-                current['last_frame'] = min(current['last_frame'] + self.buffer_frames, self.image_sequence_length - 1)
-                merged_detections.append(current)
-                i = j
-        
-        # Convert merged detections back to DataFrame
-        df = pd.DataFrame(merged_detections)
+                while i < len(group_rows):
+                    current = group_rows[i].copy()
+                    j = i + 1
+                    
+                    while j < len(group_rows):
+                        next_det = group_rows[j]
+                        # Only merge if it's the same track_id and frames are within tolerance
+                        if (next_det['track_id'] == current['track_id'] and 
+                            next_det['first_frame'] <= current['last_frame'] + self.tolerance_threshold):
+                            current['last_frame'] = max(current['last_frame'], next_det['last_frame'])
+                            j += 1
+                        else:
+                            break
+                            
+                    # Add buffer frames
+                    current['first_frame'] = max(0, current['first_frame'] - self.buffer_frames)
+                    current['last_frame'] = min(current['last_frame'] + self.buffer_frames, self.image_sequence_length - 1)
+                    merged_detections.append(current)
+                    i = j
+            
+            # Convert merged detections back to DataFrame
+            df = pd.DataFrame(merged_detections)
+        else:
+            # For periodic saves: just add buffer frames without merging
+            detections = df.to_dict('records')
+            for det in detections:
+                det['first_frame'] = max(0, det['first_frame'] - self.buffer_frames)
+                det['last_frame'] = min(det['last_frame'] + self.buffer_frames, self.image_sequence_length - 1)
+            df = pd.DataFrame(detections)
 
         # Reset the data structures with filtered results
         self.passing_data = {
@@ -780,15 +1002,52 @@ class VehiclePassTracker:
             'bbox_y2': df['bbox_y2'].tolist()
         }
         
-        self.pass_count = len(df)
+        # Update pass_count to maximum pass_id to prevent reuse
+        if len(df) > 0:
+            self.pass_count = max(df['pass_id'].tolist())
+        else:
+            self.pass_count = 0
 
-    def save_to_csv(self):
-        """Post-process and save tracking results to CSV"""
-        # Apply post-processing (merging, filtering, etc.)
-        self.post_process_detections()
+    def save_to_csv(self, post_process=True):
+        """Save tracking results to CSV
+        
+        Args:
+            post_process: If True, apply full post-processing (merging, filtering) before saving.
+                         If False, save raw data without modification for periodic intermediate saves.
+        """
+        # For periodic saves, save raw data without modifying passing_data
+        # This prevents data loss - events are preserved in memory for final save
+        if post_process:
+            # Apply full post-processing (merging, filtering, etc.) for final save
+            # This modifies passing_data in place, which is OK for final save
+            self.post_process_detections(merge_events=True)
+            data_to_save = self.passing_data
+        else:
+            # For periodic saves, work on a COPY to avoid modifying passing_data
+            # This ensures all events remain in memory for final save
+            import copy
+            data_copy = {
+                'pass_id': self.passing_data['pass_id'].copy(),
+                'track_id': self.passing_data['track_id'].copy(),
+                'first_frame': self.passing_data['first_frame'].copy(),
+                'last_frame': self.passing_data['last_frame'].copy(),
+                'passing_frame': self.passing_data['passing_frame'].copy(),
+                'vehicle_class': self.passing_data['vehicle_class'].copy(),
+                'ref_point_distance': self.passing_data['ref_point_distance'].copy(),
+                'passing_angle': self.passing_data['passing_angle'].copy(),
+                'bbox_x1': self.passing_data['bbox_x1'].copy(),
+                'bbox_y1': self.passing_data['bbox_y1'].copy(),
+                'bbox_x2': self.passing_data['bbox_x2'].copy(),
+                'bbox_y2': self.passing_data['bbox_y2'].copy()
+            }
+            # Update completed_pass_ids from current data (for duplicate prevention)
+            if len(data_copy['pass_id']) > 0:
+                current_pass_ids = set(data_copy['pass_id'])
+                self.completed_pass_ids.update(current_pass_ids)
+            data_to_save = data_copy
 
         # Convert to DataFrame and sort by last_frame
-        df = pd.DataFrame(self.passing_data)
+        df = pd.DataFrame(data_to_save)
         df = df.sort_values('last_frame')
         
         csv_path = os.path.join(self.output_folder, 'vehicle_passing.csv')

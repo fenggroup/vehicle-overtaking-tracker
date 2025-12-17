@@ -50,11 +50,16 @@ class OnnxRTDetrDetector:
     """
 
     def __init__(self, onnx_path: str, confidence_threshold: float = 0.4) -> None:
-        # Use Intel GPU (DirectML) with CPU fallback
-        providers = [
-            'DmlExecutionProvider',
-            'CPUExecutionProvider'
-        ]
+        # Provider priority: CUDA (if installed) > DirectML (if installed) > CPU
+        available_providers = ort.get_available_providers()
+
+        providers = []
+        if 'CUDAExecutionProvider' in available_providers:
+            providers.append('CUDAExecutionProvider')
+        elif 'DmlExecutionProvider' in available_providers:
+            providers.append('DmlExecutionProvider')
+        providers.append('CPUExecutionProvider')
+
         self.session = ort.InferenceSession(onnx_path, providers=providers)
         self.confidence_threshold = confidence_threshold
         
@@ -226,6 +231,15 @@ class OnnxRTDetrDetector:
         )
 
     def infer(self, image_bgr: np.ndarray) -> sv.Detections:
+        """
+        Run RT-DETR inference on an image.
+        
+        Args:
+            image_bgr: Input image in BGR format
+        
+        Returns:
+            Filtered detections with confidence >= confidence_threshold
+        """
         inputs, (orig_w, orig_h) = self._preprocess(image_bgr)
         outputs = self.session.run(None, inputs)
         output_names = [o.name for o in self.session.get_outputs()]
@@ -235,17 +249,18 @@ class OnnxRTDetrDetector:
         # Output 0: [N, 6] - each row is [class_id, score, x1, y1, x2, y2]
         # Output 1: [1] - number of detections
         if len(outputs) >= 2:
-            return self._postprocess_paddledet(outputs[0], outputs[1], (orig_w, orig_h))
-        
+            detections = self._postprocess_paddledet(outputs[0], outputs[1], (orig_w, orig_h))
         # Path 1: logits + boxes (cxcywh) - legacy format
-        if any("pred_logits" in k for k in out_map.keys()) and any("pred_boxes" in k for k in out_map.keys()):
-            return self._postprocess_logits_boxes(
+        elif any("pred_logits" in k for k in out_map.keys()) and any("pred_boxes" in k for k in out_map.keys()):
+            detections = self._postprocess_logits_boxes(
                 out_map[[k for k in out_map.keys() if "pred_logits" in k][0]],
                 out_map[[k for k in out_map.keys() if "pred_boxes" in k][0]],
                 (orig_w, orig_h),
             )
-
-        # Path 2: direct boxes/scores/classes (xyxy) - legacy format
-        return self._postprocess_direct(out_map)
+        else:
+            # Path 2: direct boxes/scores/classes (xyxy) - legacy format
+            detections = self._postprocess_direct(out_map)
+            
+        return detections
 
 
