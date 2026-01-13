@@ -671,6 +671,9 @@ class VehiclePassTracker:
         if self.display:
             cv2.destroyAllWindows()
 
+        # Force flush any remaining active tracks
+        self._finalize_tracks()
+
         # Save tracking data to CSV
         self.save_to_csv()
 
@@ -781,6 +784,15 @@ class VehiclePassTracker:
         for track_id in tracks_to_remove:
             self._remove_track(track_id)
 
+    def _finalize_tracks(self):
+        """Force record any remaining confirmed tracks at end of processing"""
+        logger.info("Finalizing all active tracks...")
+        for track_id in list(self.potential_passing_tracks.keys()):
+            track_data = self.potential_passing_tracks[track_id]
+            if track_data.get('was_confirmed', False):
+                logger.info(f"Force recording active track {track_id} at end of sequence")
+                self._record_passing_event(track_id, True)
+
     def _record_passing_event(self, track_id, was_confirmed=False):
         """Record a completed passing event"""
         track_data = self.potential_passing_tracks[track_id]  
@@ -793,7 +805,7 @@ class VehiclePassTracker:
         last_frame = track_data['last_seen']
         
         # Filter out events that are too short (likely noise or false positives)
-        if last_frame - first_frame <= self.min_event_duration_frames:
+        if last_frame - first_frame < self.min_event_duration_frames:
             return
             
         # Get the passing frame from track data (stored when first confirmed)

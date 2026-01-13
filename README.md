@@ -83,18 +83,6 @@ python main.py \
     --excluded-frames ./data/excluded_frames.csv
 ```
 
-## For Feng Group Members:
-
-Clone the repo and place your image sequence for one trip in `data/input_trip/`:
-
-```bash
-python main.py --input ./data/input_trip --output ./results
-```
-
-See [Command Line Options](#command-line-options) and [Performance Optimization](#performance-optimization) for configuration options.
-
-GPU acceleration is automatically enabled when available.
-
 ## Command Line Options
 
 | Option | Default | Description |
