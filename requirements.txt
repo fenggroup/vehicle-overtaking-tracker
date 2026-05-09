@@ -1,5 +1,8 @@
 # Core dependencies
-onnxruntime==1.17.3   # ONNX inference
+# Use onnxruntime-gpu for GPU support (required for HPC/GPU environments)
+# For CPU-only systems, use: onnxruntime==1.17.3   # ONNX inference
+# Version 1.20.0 supports CUDA 12.x (required for HPC with CUDA 12.1.1)
+onnxruntime-gpu==1.20.0   # ONNX inference with CUDA 12 support
 opencv-python==4.9.0.80  # Image processing
 supervision>=0.16.0     # ByteTrack implementation
 pandas==2.2.2        # Data handling

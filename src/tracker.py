@@ -218,6 +218,20 @@ class VehiclePassTracker:
             'bbox_y2': []
         }
 
+        self.frame_data = {
+            'pass_id': [],
+            'frame_id': [],
+            'track_id': [],
+            'bbox_x1': [],
+            'bbox_y1': [],
+            'bbox_x2': [],
+            'bbox_y2': [],
+            'vehicle_class': [],
+            'confidence': [],
+            'angle': [],
+            'bbox_area': []
+        }
+
         # Initialize tracking state variables
         self.active_tracks = {}
         self.completed_pass_ids = set()
@@ -582,6 +596,9 @@ class VehiclePassTracker:
                 # Update tracks with ByteTrack results
                 detections = self.tracker.update_with_detections(detections)
 
+                # Log frame-level data for all tracked vehicles
+                self._log_frame_data(detections, frame_width, frame_height, current_frame)
+
                 # Log detection details (with gap summary if frames were skipped due to no detections)
                 self._log_frame_details(current_frame, detections, last_logged_frame)
 
@@ -677,6 +694,10 @@ class VehiclePassTracker:
         # Save tracking data to CSV
         self.save_to_csv()
 
+        # Assign pass_id to frame-level data and export
+        self._assign_pass_ids_to_frames()
+        self.save_frames_to_csv()
+
     def _log_frame_details(self, frame_number, detections, last_logged_frame):
         """Log detailed information about the current frame"""
         if len(detections) > 0 or self.potential_passing or self.confirmed_passing:
@@ -717,6 +738,39 @@ class VehiclePassTracker:
             # Log directly using logger
             message = "\n".join(log_entry)
             logging.info(message)
+
+    def _log_frame_data(self, detections, frame_width, frame_height, current_frame):
+        """Log frame-level data for all tracked vehicles."""
+        if len(detections) == 0:
+            return
+
+        for i in range(len(detections)):
+            track_id = None
+            if hasattr(detections, "tracker_id") and detections.tracker_id is not None:
+                track_id = detections.tracker_id[i]
+            if track_id is None:
+                continue
+
+            x1, y1, x2, y2 = detections.xyxy[i]
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+            angle = calculate_angle(center_x, center_y, frame_height, frame_width, self.image_source_position)
+            bbox_area = (x2 - x1) * (y2 - y1)
+            confidence = None
+            if detections.confidence is not None:
+                confidence = float(detections.confidence[i])
+
+            self.frame_data['pass_id'].append(None)
+            self.frame_data['frame_id'].append(int(current_frame))
+            self.frame_data['track_id'].append(int(track_id))
+            self.frame_data['bbox_x1'].append(float(x1))
+            self.frame_data['bbox_y1'].append(float(y1))
+            self.frame_data['bbox_x2'].append(float(x2))
+            self.frame_data['bbox_y2'].append(float(y2))
+            self.frame_data['vehicle_class'].append(int(detections.class_id[i]))
+            self.frame_data['confidence'].append(confidence)
+            self.frame_data['angle'].append(float(angle))
+            self.frame_data['bbox_area'].append(float(bbox_area))
 
     def process_tracks(self, detections, frame_width, current_frame):
         """Process detected tracks and update passing events"""
@@ -1062,7 +1116,32 @@ class VehiclePassTracker:
         df = pd.DataFrame(data_to_save)
         df = df.sort_values('last_frame')
         
-        csv_path = os.path.join(self.output_folder, 'vehicle_passing.csv')
+        csv_path = os.path.join(self.output_folder, 'vehicle_passing_events.csv')
         df.to_csv(csv_path, index=False)
         logger.info(f"Results saved to: {csv_path} ({len(df)} events)")
         print(f"Total confirmed vehicle passing events: {len(df)}")
+
+    def _assign_pass_ids_to_frames(self):
+        """Assign pass_id values to frame-level rows based on final event data."""
+        if not self.frame_data['frame_id']:
+            return
+
+        pass_id_by_track = {}
+        for track_id, pass_id in zip(self.passing_data['track_id'], self.passing_data['pass_id']):
+            pass_id_by_track[int(track_id)] = int(pass_id)
+
+        for i, track_id in enumerate(self.frame_data['track_id']):
+            if track_id in pass_id_by_track:
+                self.frame_data['pass_id'][i] = pass_id_by_track[track_id]
+
+    def save_frames_to_csv(self):
+        """Save frame-level tracking data to CSV."""
+        if not self.frame_data['frame_id']:
+            logger.info("No frame-level data to save.")
+            return
+
+        df = pd.DataFrame(self.frame_data)
+        df = df.sort_values(['frame_id', 'track_id'])
+        csv_path = os.path.join(self.output_folder, 'vehicle_frames.csv')
+        df.to_csv(csv_path, index=False)
+        logger.info(f"Frame-level data saved to: {csv_path} ({len(df)} rows)")
