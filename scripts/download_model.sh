@@ -4,7 +4,7 @@
 set -e
 
 # Configuration - Update these when creating GitHub release
-GITHUB_REPO="YOUR-ORG/rtdetr-vot"
+GITHUB_REPO="fenggroup/vehicle-overtaking-tracker"
 RELEASE_TAG="v1.0.0"
 MODEL_FILE="rtdetr.onnx"
 DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}/${MODEL_FILE}"

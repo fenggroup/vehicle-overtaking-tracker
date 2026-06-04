@@ -2,7 +2,7 @@
 REM Download pre-exported RT-DETR ONNX model from GitHub Releases
 
 REM Configuration - Update these when creating GitHub release
-set GITHUB_REPO=YOUR-ORG/rtdetr-vot
+set GITHUB_REPO=fenggroup/vehicle-overtaking-tracker
 set RELEASE_TAG=v1.0.0
 set MODEL_FILE=rtdetr.onnx
 set DOWNLOAD_URL=https://github.com/%GITHUB_REPO%/releases/download/%RELEASE_TAG%/%MODEL_FILE%

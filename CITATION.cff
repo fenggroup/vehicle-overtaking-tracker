@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software in your research, please cite it as below."
+type: software
+title: "Vehicle Overtaking Tracker: An Automated Overtaking Event Detection System"
+version: 1.0.0
+license: MIT
+repository-code: "https://github.com/fenggroup/vehicle-overtaking-tracker"
+authors:
+  - family-names: "Padmanaban"
+    given-names: "Gandhimathi"
+  - family-names: "Moustafa"
+    given-names: "Rayane"
+  - family-names: "Feng"
+    given-names: "Fred"
+abstract: >
+  A computer vision system for detecting and analyzing vehicle overtaking events
+  from bicycle-mounted camera image sequences. Combines RT-DETR object detection
+  with ByteTrack multi-object tracking and geometry-based validation to identify
+  and record passing events.
+keywords:
+  - computer vision
+  - vehicle detection
+  - object tracking
+  - bicycle safety
+  - RT-DETR
+  - ByteTrack

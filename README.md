@@ -65,9 +65,9 @@ For manual export or if download fails:
 
 Note: Export requires Python 3.8-3.11 with PaddlePaddle
 
-#### For Collaborators
+#### Using a Shared Pre-built Model
 
-See [docs/MODEL_MANAGEMENT.md](docs/MODEL_MANAGEMENT.md) for model sharing and versioning
+See [docs/MODEL_MANAGEMENT.md](docs/MODEL_MANAGEMENT.md) for model versioning and team workflows
 
 ### 3. Run the Tracker
 ```bash
@@ -90,7 +90,7 @@ python main.py \
 | --input | Required | Path to input image sequence folder |
 | --output | ./results | Path to output folder |
 | --mode | demo | Operation mode (demo/debug) |
-| --camera-position | bottom_center | Camera position (bottom_center/bottom_left) |
+| --camera-position | bottom_left | Camera position (bottom_center/bottom_left) |
 | --excluded-frames | None | Optional CSV file with frames to exclude |
 | --onnx-model | rtdetr.onnx | Path to RT-DETR ONNX model file |
 | --no-display | False | Run in headless mode (no visualization window) |
@@ -136,7 +136,7 @@ frame_number,notes
 tracker = VehiclePassTracker(
     image_sequence_path='./data/input_trip/',
     output_folder='./results/',
-    image_source_position='bottom_center',  # or 'bottom-left'
+    image_source_position='bottom_center',  # or 'bottom_left'
 )
 ```
 
@@ -360,8 +360,7 @@ If you use this software in your research, please cite:
 ```
 rtdetr-vot/
 ├── data/
-│   ├── ground_truth_annotations/
-│   └── input_trip/
+│   └── ground_truth_annotations/
 ├── docs/
 │   ├── ALGORITHM_REFERENCE.md
 │   ├── CONTRIBUTING.md
@@ -374,13 +373,12 @@ rtdetr-vot/
 │   └── rtdetr_l/
 │       └── model.pdparams
 ├── results/
-│   ├── inference_images/
-│   ├── vehicle_passing.csv
-│   └── tracking_debug.log
 ├── scripts/
-│   ├── download_rtdetr.bat
-│   ├── download_rtdetr.sh
-│   └── export_rtdetr_onnx.py
+│   ├── download_model.bat        # Download pre-built ONNX model (Windows)
+│   ├── download_model.sh         # Download pre-built ONNX model (Linux/macOS)
+│   ├── download_rtdetr.bat       # Download PaddleDetection weights + export (Windows)
+│   ├── download_rtdetr.sh        # Download PaddleDetection weights + export (Linux/macOS)
+│   └── export_rtdetr_onnx.py     # Export RT-DETR to ONNX from PaddleDetection weights
 ├── src/
 │   ├── detectors.py
 │   ├── tracker.py
@@ -390,8 +388,7 @@ rtdetr-vot/
 ├── LICENSE
 ├── main.py
 ├── README.md
-├── requirements.txt
-└── vehicle_pass_tracker_analysis.ipynb
+└── requirements.txt
 ```
 
 ## Troubleshooting
